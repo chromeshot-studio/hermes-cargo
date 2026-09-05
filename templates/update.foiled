@@ -1,0 +1,131 @@
+# ---------------------------------------------------------------------------
+# HERMES update plan - a template. This file ships INSIDE your release archive,
+# named update.foiled at its root.
+#
+# What this file is: instructions. What to install, where it goes, and what to
+# keep. It is declarative on purpose - the user can read the whole of what an
+# update intends to do before any of it happens.
+#
+# There is no `run`, `exec` or `script` step, and there never will be. Every
+# operation you can ask for is a file operation inside a folder scope the user
+# approved, so an update cannot turn into arbitrary code execution.
+#
+# Check yours before you ship it:   hermes inspect update.foiled
+# ---------------------------------------------------------------------------
+
+schema    = "hermes.foiled/v1"
+
+# Must match the id in your .origin, and the version in the signed manifest.
+# HERMES refuses the update if either disagrees.
+origin_id = "moonforge.starfall"
+version   = "1.4.0"
+
+# How the new install tree starts out:
+#   "clone" - a copy of what is installed now, which your steps then patch.
+#             Use this for patches and for anything that must keep user data.
+#   "empty" - nothing. Use this for a full replacement package.
+base      = "clone"
+
+notes     = "Adds the Deep Field expansion."
+
+# ---------------------------------------------------------------------------
+# Optional: ask where the software is installed
+# ---------------------------------------------------------------------------
+#
+# Only needed when HERMES did not install it in the first place - software
+# bought elsewhere, unzipped by hand, or installed long before HERMES existed.
+# The folder is something only the user knows, so ask.
+#
+# This is the whole of what you may say. You do NOT name the folder: the user
+# types or drags it in, and HERMES refuses anything that is not an existing
+# folder containing `expect` (and refuses drive roots, the home directory and
+# its parents outright). Every path in the scope below is then resolved against
+# whatever they chose and shown to them before they approve it.
+#
+# The answer is remembered, so this is asked once per application, not once per
+# update. Delete the block entirely if HERMES installed the software itself.
+#
+# [locate]
+# prompt = "Where is Starfall installed?"
+# expect = "bin/starfall.exe"
+
+# ---------------------------------------------------------------------------
+# Scope - the folders this plan may touch
+# ---------------------------------------------------------------------------
+#
+# The user is shown this list verbatim and has to approve it. A step touching
+# anything outside it aborts the update before a single byte is written, so
+# declare exactly what you need and no more.
+#
+#   access     "read" < "write" < "delete". A write grant does NOT authorise a
+#              delete; ask for the weakest level that actually works.
+#   recursive  false means direct children only. A plan holding "." still has
+#              to declare "saves" separately to reach inside it.
+#   reason     shown to the user. Write it for them, not for you.
+#
+# Paths are relative to the install root. "." is the root itself.
+
+[[scope]]
+path      = "bin"
+recursive = true
+access    = "write"
+reason    = "replace the game executable"
+
+[[scope]]
+path      = "saves"
+recursive = true
+access    = "read"
+reason    = "keep your save files"
+
+[[scope]]
+path      = "data"
+recursive = true
+access    = "delete"
+reason    = "install new content, remove content this version retires"
+
+# ---------------------------------------------------------------------------
+# Steps - what to do, in order
+# ---------------------------------------------------------------------------
+#
+# Paths in `from` (copy) and `archive` (extract_zip) are read out of your
+# release archive. Every other path is inside the install tree being built.
+#
+# The seven actions:
+#
+#   copy        from the archive into the install tree
+#   extract_zip unpack a zip that shipped inside the archive
+#   move        move something within the install tree
+#   delete      remove something from the new tree (recursive = true for a
+#               folder and everything under it)
+#   mkdir       create a folder
+#   preserve    carry something from the current install into the new tree,
+#               untouched - saves, configs, mods
+#   backup      snapshot something from the current install before it is
+#               replaced; kept outside the install folder afterwards
+#
+# Nothing here touches the live installation. HERMES builds the whole new tree
+# beside it and renames it into place at the very end, so a crash or a Ctrl-C
+# anywhere in here leaves what is installed exactly as it was.
+
+[[steps]]
+action = "backup"
+path   = "saves"
+
+[[steps]]
+action = "preserve"
+path   = "saves"
+
+[[steps]]
+action = "copy"
+from   = "bin/starfall.exe"   # read from your release archive
+to     = "bin/starfall.exe"   # written into the new install tree
+
+[[steps]]
+action  = "extract_zip"
+archive = "content.zip"
+dest    = "data"
+
+[[steps]]
+action    = "delete"
+path      = "data/old-content.pak"
+recursive = false

@@ -236,7 +236,6 @@ mod tests {
             public_key,
             publisher: None,
             homepage: None,
-            install_dir: None,
             requires_auth: false,
         }
     }

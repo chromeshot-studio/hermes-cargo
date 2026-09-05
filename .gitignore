@@ -1,9 +1,13 @@
 /target
 /dist
 .staging/
+keys
+rooter.origin
+ARCHITECTURE.md
 
 # Signing keys never belong in the repository. release.py keeps them in your
 # home directory; this is the second line of defence.
+keys
 *.key
 
 # Cargo.lock is committed: this is a binary, and pinning the exact

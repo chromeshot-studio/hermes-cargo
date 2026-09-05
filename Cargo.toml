@@ -3,7 +3,7 @@ name = "hermes"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
-description = "HERMES - a zero-infrastructure, decentralized CLI updater"
+description = "HERMES - a general CLI updater"
 license = "MIT OR Apache-2.0"
 
 [[bin]]

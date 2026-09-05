@@ -1,245 +1,440 @@
-# Working on HERMES
+# Publishing with HERMES
 
-Notes for people changing the code. If you are a studio publishing software
-with HERMES, you want the studio section of [README.md](README.md) instead.
+A guide for studios and developers shipping software through HERMES. It walks
+the whole path: making a signing key, writing the two files your users and your
+updates need, signing a manifest, and putting a release somewhere people can
+get it.
 
-Read the [invariants](#invariants) before touching anything under
-`src/security/` or `src/update.rs`. Most of them are one line of code away from
-being silently broken, and none of them fail loudly on their own.
+**Changing HERMES itself?** That is [INTERNALS.md](INTERNALS.md).
 
-## Layout
+You host everything. There is no HERMES server, no account with anyone, no
+registry to submit to and no review to pass. If you can put two files on a URL,
+you can ship updates.
 
-| Path | Role |
-| --- | --- |
-| `src/main.rs` | CLI surface (clap), command handlers, `studio` subcommands |
-| `src/tui.rs` | The interactive list shown when `hermes` is run with no arguments |
-| `src/install.rs` | `hermes install` - permanent location and `PATH` management |
-| `src/selfupdate.rs` | `hermes self-update` - replacing the running binary |
-| `src/schema.rs` | The three document formats and their validation |
-| `src/registry.rs` | The `.origin` registry, key pinning, drag-and-drop path parsing |
-| `src/security/crypto.rs` | Ed25519 verification, streaming SHA-256, rollback refusal |
-| `src/security/safepath.rs` | Path sanitising, Zip-Slip prevention, archive limits |
-| `src/security/consent.rs` | Scope resolution, scope enforcement, the `Y` prompt |
-| `src/net.rs` | The two HTTP clients; streaming download that hashes in flight |
-| `src/update.rs` | The pipeline and the atomic swap |
-| `src/fsx.rs` | Tree copy/clone/move/delete helpers |
-| `src/auth.rs` | Localhost callback login, token storage |
-| `src/system_icons.rs` | Per-OS file associations, embedded icons |
-| `src/paths.rs` | Where state lives; private-file helpers |
-| `src/error.rs` | `SecurityError` — the type that means "stop" |
-| `tools/gen_icons.py` | Generates `assets/icons/` from primitives |
-| `tools/e2e_test.py` | Full round trip against a local studio, plus attacks |
-| `tools/release.py` | Build, package, sign and lay out a release in `dist/` |
-| `tools/demo_studio.py` | A local studio to drive the CLI against by hand |
+## Contents
 
-## The pipeline
+1. [The three files](#the-three-files)
+2. [Step 1 — make a signing key](#step-1--make-a-signing-key)
+3. [Step 2 — write the `.origin`](#step-2--write-the-origin)
+4. [Step 3 — write the `.foiled` plan](#step-3--write-the-foiled-plan)
+5. [Step 4 — package the release](#step-4--package-the-release)
+6. [Step 5 — sign the manifest](#step-5--sign-the-manifest)
+7. [Step 6 — publish](#step-6--publish)
+8. [Offering more than one version](#offering-more-than-one-version)
+9. [Shipping for several platforms](#shipping-for-several-platforms)
+10. [Patching software HERMES did not install](#patching-software-hermes-did-not-install)
+11. [If your software needs an account](#if-your-software-needs-an-account)
+12. [Rotating a key](#rotating-a-key)
+13. [Release checklist](#release-checklist)
 
-`update::apply` runs in this order, and **the order is the design**:
+## The three files
 
-```
- 1. fetch manifest                      net::HttpClient::fetch_manifest
- 2. verify signature                    crypto::verify_manifest
- 3. refuse replays and rollbacks        crypto::assert_no_rollback
- 4. stream .zip -> staging, hashing     net::stream_download
- 5. compare digest to signed checksum   crypto::verify_checksum
- 6. extract into staging                safepath::extract_zip_secure
- 7. read plan, enforce declared scope   consent::enforce_plan_scope
- 8. ask the user                        consent::request_consent
- 9. build the new tree in staging       update::execute_plan
-10. rename into place                   update::swap_into_place
-```
+| File | Who has it | What it is |
+| --- | --- | --- |
+| `.origin` | your users, added once | **An address.** Your identity and the URL updates come from, plus the public key that signs them. Nothing about their disk. |
+| `manifest.json` | your CDN, replaced each release | **A signed statement.** Which version is current, where the archive is, and its SHA-256. |
+| `.foiled` | inside each archive | **Instructions.** What to install, where it goes, what to keep. |
 
-Nothing is unpacked before step 5. The live install directory is not touched
-before step 10. Both facts are load-bearing — if you find yourself moving work
-earlier for performance, you are removing a security property.
+The `.origin` is the only thing a user has to trust, and they get it from you
+once. Everything after that is verified against the key inside it, so your CDN,
+your mirrors and the network in between are all untrusted transport.
 
-Staging lives in `<install-parent>/.staging/<id>-<nonce>/`, deliberately *not*
-in `~/.config/hermes`, so that step 10 is a same-volume `rename`. `Staging`
-implements `Drop`, so an early return at any point cleans up after itself.
-
-## Invariants
-
-**1. An untrusted path is a string, not a path.**
-Anything from an archive, a manifest or a `.foiled` plan goes through
-`safepath::sanitize_relative` or `safepath::resolve_within` before it is joined
-onto anything. Never `root.join(untrusted)`. `resolve_within` also walks every
-existing ancestor and refuses symlinks, which is what stops a write from
-travelling through a link planted earlier in the same archive.
-
-**2. Nothing is unpacked before the checksum matches.**
-`verify_checksum` runs on the digest computed *during* the download. Do not add
-a "peek inside the archive first" step.
-
-**3. The manifest signature covers raw bytes.**
-`SignedManifest.payload` is a `serde_json::value::RawValue`. Verification runs
-over `payload.get().as_bytes()` — the exact bytes on the wire. Never
-re-serialize a parsed struct and verify against that; the moment a verifier and
-a signer can disagree about formatting, the scheme is broken. This is also why
-`manifest.json` stays JSON while the other two formats are TOML.
-
-**4. Scope is enforced before consent, not after.**
-`enforce_plan_scope` runs first and aborts on any undeclared path. The user is
-never offered the chance to approve something the plan did not declare. Keep
-these two steps in that order and keep them separate.
-
-**5. Every path a step touches must appear in `FoiledStep::touched()`.**
-This is the easiest way to introduce a hole. `touched()` is the *only* thing
-the scope engine consults. A path your step writes but does not report is a
-path nobody checked.
-
-**6. There is no code execution step.**
-No `run`, no `exec`, no `script`, no post-install hook, no shelling out to an
-installer. If a feature seems to need one, it does not belong in `.foiled`.
-
-**7. Deny by default.**
-No TTY means no consent (`SecurityError::ConsentUnavailable`). `--yes` skips
-the keystroke, never the enforcement.
-
-**8. Security failures surface as `SecurityError`.**
-They exit with code `2` and a loud banner. Never map one into a generic
-`anyhow!` string, never `unwrap_or_default()` one away, and never retry after
-one. `cmd_update` deliberately propagates a `SecurityError` immediately instead
-of continuing to the next application.
-
-**9. Unlink before create.**
-`clone_tree` hard-links files into the staging tree for speed, so writing into
-a cloned file in place would corrupt the *live* install. Every writer removes
-the target first and then creates exclusively (`create_new(true)`).
-
-**10. Archive entries are regular files and directories only.**
-Symlinks, devices, FIFOs and duplicate entries are refused outright, and
-setuid/setgid/sticky bits from archive metadata are dropped on the floor.
-
-**11. `self-update` may skip the directory swap, never the verification.**
-`src/selfupdate.rs` exists only because Windows will not rename a directory
-containing a running `.exe`. It reuses `update::check`, `stream_download`,
-`verify_checksum` and `extract_zip_secure` unchanged, and differs *only* in the
-final move. If you touch it, the rule is that every byte is still verified
-before anything is written, and the old binary is restored if the swap fails.
-
-**12. The interactive mode never approves anything.**
-`src/tui.rs` has no consent logic of its own. Every action that needs a
-decision calls `Screen::suspend`, drops back to the ordinary terminal, and runs
-the same command-line code path with the same prompt. If you ever find yourself
-adding a "confirm" to the TUI, you are building a second security boundary that
-will drift out of step with the real one.
-
-## Adding a `.foiled` step
-
-1. Add the variant to `FoiledStep` in `src/schema.rs`. The enum is internally
-   tagged (`#[serde(tag = "action", rename_all = "snake_case")]`), so
-   `[[steps]] action = "your_step"` maps to it automatically.
-2. Implement its arms in `name()`, `describe()` and — carefully — `touched()`.
-   Return **every** install-tree path with the weakest access that actually
-   suffices: `Access::Read` for something you only read, `Delete` for anything
-   that removes. Paths inside the extracted payload are excluded, because the
-   payload is a sandbox we own.
-3. Handle it in `update::execute_plan`, resolving each path through
-   `resolve_within` against the correct root: `staging.payload` for payload
-   reads, `staging.next` for the tree being built, `install_dir` for reads of
-   the live install (`backup`, `preserve` — and those also call
-   `assert_within`).
-4. Add a test in `src/security/consent.rs` proving the step is refused when its
-   path falls outside the declared scope.
-5. Add a case to `tools/e2e_test.py`.
-
-Step 4 is not optional. Every existing step has one.
-
-## Adding an OS to `install-system`
-
-`src/system_icons.rs` dispatches to a `platform` module selected by
-`#[cfg(target_os = ...)]`, with a fallback module that warns and does nothing.
-Implement `install(exe, icons, report)` and `uninstall(report)`. Rules:
-
-* **Per-user only.** No admin, no sudo, nothing outside the user's profile.
-* **Reversible.** `uninstall` must undo everything, and must not stomp an
-  association that some other application has since claimed.
-* **Absolute, non-verbatim exe path.** Use `current_exe()`, which strips the
-  `\\?\` prefix `canonicalize` adds on Windows — a verbatim path in
-  `shell\open\command` produces an association that silently does nothing.
-* Embed new icon assets behind `#[cfg]` in the `embedded` module so each
-  platform's binary carries only its own formats.
-
-## Testing
+Start each of the two you write by hand from a commented template:
 
 ```sh
-cargo test                                  # 43 unit tests, no network
-cargo build && python tools/e2e_test.py     # 44 checks, ~10s
+hermes studio template origin --out starfall.origin
+hermes studio template foiled --out update.foiled
 ```
 
-Unit tests cover the pure logic: path sanitising (the Zip-Slip corpus),
-signature verification, scope matching, drag-and-drop parsing, and — on
-Windows — the registry writes, which run against a scratch key
-(`HKCU\Software\Hermes.SelfTest`) and never touch real associations.
+## Step 1 — make a signing key
 
-`tools/e2e_test.py` drives the real binary against a real HTTP studio on
-`127.0.0.1:8099`. It plays every role: generates a key, packages a release,
-signs a manifest, serves it, acts as the browser during login, then asserts
-what landed on disk. It runs under `target/e2e` with `HERMES_HOME` redirected.
+```sh
+hermes studio keygen --id moonforge.starfall --out ~/.hermes-keys
+```
 
-Three environment variables exist for testing and nothing else:
-`HERMES_HOME`, `HERMES_NO_BROWSER=1`, and `HERMES_ALLOW_INSECURE_HTTP=1` (which
-relaxes the https requirement for **loopback hosts only** — check
-`schema::require_secure_url` before assuming it does more).
+That writes `~/.hermes-keys/moonforge.starfall.key` and prints the public half:
 
-**Any change to `src/security/` needs a test that fails without it.** A change
-that tightens a check should come with the input that used to get through.
+```
+  public_key: 0FMFR1Kx8Tn0aQb0lJ0KpXQMPzGSTQFyO7oxVw2vGxk=
+```
 
-## Threat model
+The `--id` is your permanent identifier. Lowercase letters, digits, `.`, `-`
+and `_`. It becomes the filename in every user's registry, so choose it once:
+changing it later makes every existing user look like a brand new one.
+Reverse-domain style (`moonforge.starfall`) keeps it unique without anyone
+having to hand out names.
 
-Defended against:
+**The `.key` file is the whole of your security.** Anyone who has it can sign
+an update that every one of your users installs, without touching your servers.
 
-* A hostile or compromised CDN, mirror, or network path. It serves bytes; the
-  pinned key decides whether they mean anything.
-* Malicious archive contents — traversal, symlinks, duplicate entries, zip
-  bombs, setuid bits.
-* An over-reaching `.foiled` plan from an otherwise-legitimate studio.
-* Replay of an old signed manifest, and signed downgrades.
-* A local web page trying to POST a token into the login callback (the `state`
-  parameter).
-* Token leakage through a redirect off https.
+* Keep it off the machine that builds releases if you can, and out of CI.
+* Never commit it. HERMES's own `.gitignore` refuses `*.key` as a second line
+  of defence; add the same rule to yours.
+* Back it up somewhere offline. Losing it means every user has to add a new
+  `.origin` by hand — see [rotating a key](#rotating-a-key).
 
-**Not** defended against, by design:
+## Step 2 — write the `.origin`
 
-* A compromised studio signing key. Pinning means the key *is* the authority.
-  The mitigation is social: `hermes add` refuses a changed key for an already
-  registered origin and makes the user confirm it explicitly.
-* A compromised local account. HERMES's state is ordinary files owned by the
-  user; anything running as that user can edit them.
-* The behaviour of the software being installed. HERMES puts files on disk
-  safely; it does not sandbox what you then run.
-* HERMES's own dependency supply chain. `Cargo.lock` is committed so builds are
-  reproducible and the tree is auditable — keep it that way, and keep the
-  dependency list short.
+This is the file you put on your website for people to download. `hermes studio
+new-origin` fills it in from your key:
 
-## Conventions
+```sh
+hermes studio new-origin \
+    --key ~/.hermes-keys/moonforge.starfall.key \
+    --name "Starfall" \
+    --publisher "Moonforge Games" \
+    --homepage https://moonforge.dev \
+    --manifest-url https://github.com/moonforge/starfall/releases/latest/download/manifest.json \
+    --out starfall.origin
+```
 
-* Rust 1.74+ declared (`rust-version`), developed on 1.97.1. The MSRV is
-  enforced by cargo's resolver, not by CI.
-* `cargo fmt` defaults; no `clippy` config, but the build is warning-clean —
-  keep it that way rather than adding `#[allow]`s, except where a `cfg`-gated
-  item is genuinely unused on other platforms.
-* Keep the dependency tree small and boring. The one C dependency is `ring`,
-  pulled in by rustls for TLS; everything else, including all of the signing
-  crypto and compression, is pure Rust. Adding another C dependency (or
-  anything needing cmake) needs a discussion first — it is a build-friction
-  and supply-chain cost, not just a technical one.
-* Errors: `anyhow` with `.context()` for ordinary failures, `SecurityError` for
-  anything a user's safety depends on.
-* The release profile sets `panic = "abort"`, so `Drop` does **not** run on a
-  panic. Anything that puts the terminal or the filesystem into a state that
-  needs restoring must also install a panic hook - see `tui::Screen::enter`.
-* Comments explain *why*, especially where the code looks over-cautious. Most
-  of the odd-looking checks in `safepath.rs` exist because of a specific known
-  attack; say which one.
+Which produces:
+
+```toml
+schema = "hermes.origin/v1"
+id     = "moonforge.starfall"
+name   = "Starfall"
+publisher = "Moonforge Games"
+homepage  = "https://moonforge.dev"
+
+upstream_manifest_url = "https://github.com/moonforge/starfall/releases/latest/download/manifest.json"
+
+public_key = "0FMFR1Kx8Tn0aQb0lJ0KpXQMPzGSTQFyO7oxVw2vGxk="
+```
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Permanent identifier, same as the key's |
+| `name` | What users see in listings and in the permission prompt |
+| `publisher` | Who made it. A claim, not a credential |
+| `homepage` | Where to read about it |
+| `upstream_manifest_url` | **Where updates live.** https, any host |
+| `public_key` | The trust anchor. Everything must be signed by its private half |
+| `studio_auth_url`, `requires_auth` | Only if updates are behind a login |
+
+There is **no install path in this file, and there cannot be**. A `.origin`
+says where updates come from, not where they go on a machine you have never
+seen. Where files land is decided by the user, or asked for by the plan.
+
+Hand this file out however you like — a download button, an email, inside your
+installer. Users run `hermes add starfall.origin` or drag it onto the HERMES
+window. Serve it as `text/plain` or `application/octet-stream`; if your CMS
+re-encodes it, make sure what comes out is still UTF-8.
+
+## Step 3 — write the `.foiled` plan
+
+This ships **inside** your release archive, named `update.foiled` at its root.
+It says what to do with the files, and it is the thing your users approve.
+
+```toml
+schema    = "hermes.foiled/v1"
+origin_id = "moonforge.starfall"
+version   = "1.4.0"
+base      = "clone"
+notes     = "Adds the Deep Field expansion."
+
+[[scope]]
+path      = "bin"
+recursive = true
+access    = "write"
+reason    = "replace the game executable"
+
+[[scope]]
+path      = "saves"
+recursive = true
+access    = "read"
+reason    = "keep your save files"
+
+[[steps]]
+action = "preserve"
+path   = "saves"
+
+[[steps]]
+action = "copy"
+from   = "bin/starfall.exe"    # from your archive
+to     = "bin/starfall.exe"    # into the new install tree
+```
+
+`origin_id` and `version` must match your `.origin` and the version in the
+signed manifest. HERMES refuses the update if either disagrees.
+
+**`base`** decides what the new install starts as. `"clone"` is a copy of
+what is installed now, which your steps then patch — use it for anything that
+must keep user data. `"empty"` starts from nothing, for a full replacement.
+
+### Scope
+
+`[[scope]]` is the list of folders your plan may touch, and your users see it
+verbatim before they approve anything. A step touching anything outside it
+aborts the update before a single byte is written.
+
+* `access` is `read`, `write` or `delete`, in that order of strength. A `write`
+  grant does **not** authorise a delete. Ask for the weakest that works.
+* `recursive = false` means direct children only. A plan holding `"."` still
+  has to declare `"saves"` separately to reach inside it.
+* `reason` is shown to the user. Write it for them.
+
+Ask for less and more people say yes. A plan wanting `[delete, recursive] .`
+is asking to be allowed to erase the install folder, and it reads that way.
+
+### Steps
+
+| Action | Does |
+| --- | --- |
+| `copy` | `from` your archive, `to` the install tree |
+| `extract_zip` | Unpack an `archive` that shipped inside your archive, into `dest` |
+| `move` | Move something within the install tree |
+| `delete` | Remove a `path` (`recursive = true` for a folder) |
+| `mkdir` | Create a folder |
+| `preserve` | Carry something from the current install into the new one — saves, configs, mods |
+| `backup` | Snapshot something before it is replaced; kept outside the install folder |
+
+**There is no `run`, `exec` or `script` step, and there never will be.** Every
+operation is a file operation inside a scope the user approved, so an update
+cannot become arbitrary code execution. If your update needs to run something,
+it needs to happen when your application next starts, not during the update.
+
+Check your plan before shipping it — this is exactly what a user sees:
+
+```sh
+hermes inspect update.foiled
+```
+
+## Step 4 — package the release
+
+Put your files and `update.foiled` in a `.zip`:
+
+```
+starfall-1.4.0.zip
+├── update.foiled
+├── bin/
+│   └── starfall.exe
+└── content.zip
+```
+
+Then get the numbers the manifest needs:
+
+```sh
+hermes studio checksum ./starfall-1.4.0.zip
+#     "checksum_sha256": "9f86d081884c7d65...",
+#     "size_bytes": 734003200
+```
+
+Archives are unpacked into a sandbox, so a few things are refused outright:
+symlinks, duplicate entries, absolute or `..` paths, and setuid bits. An
+ordinary zip of ordinary files is fine.
+
+## Step 5 — sign the manifest
+
+Write the payload — the inner object, not the whole document:
+
+```json
+{
+  "schema": "hermes.manifest/v1",
+  "origin_id": "moonforge.starfall",
+  "latest_version": "1.4.0",
+  "download_url": "https://github.com/moonforge/starfall/releases/download/v1.4.0/starfall-1.4.0.zip",
+  "checksum_sha256": "9f86d081884c7d65...",
+  "size_bytes": 734003200,
+  "issued_at": 1767225600,
+  "release_notes": "- Adds the Deep Field expansion\n- Fixes save corruption on exit"
+}
+```
+
+`issued_at` is Unix seconds and is not decoration: HERMES remembers the newest
+it has accepted and refuses anything older, so a mirror cannot replay an old
+manifest to pin someone on a stale build. Always set it to now.
+
+`release_notes` is plain text carried **inside the signed payload**, so what a
+user reads before granting folder access is exactly what you signed. It is
+shown in the permission prompt and the version list, capped at 8 KiB and 40
+lines, with control characters stripped.
+
+Optional: `expires_at`, `release_notes_url`, `minimum_client_version`,
+`foiled_path` (if your plan is not at `update.foiled`), `platforms`, `versions`,
+`requires_auth`.
+
+Then sign it:
+
+```sh
+hermes studio sign --key ~/.hermes-keys/moonforge.starfall.key \
+                   --payload ./payload.json --out ./manifest.json
+```
+
+The signature covers the payload's **raw bytes**, embedded verbatim in the
+output. Do not reformat `manifest.json` afterwards — reindenting it breaks the
+signature.
+
+Before publishing, check it the way a user's CLI will:
+
+```sh
+hermes studio verify --origin ./starfall.origin --manifest ./manifest.json
+```
+
+## Step 6 — publish
+
+Upload `manifest.json` and the `.zip`. Anywhere that serves bytes over https
+works: S3, R2, a VPS, GitHub Releases, your own web host.
+
+**GitHub Releases** is a good default because `latest` is a stable URL:
+
+```
+https://github.com/moonforge/starfall/releases/latest/download/manifest.json
+```
+
+Attach `manifest.json` and `starfall-1.4.0.zip` to each release, point
+`upstream_manifest_url` at that `latest` URL once, and you never edit the
+`.origin` again. Use the versioned URL
+(`.../releases/download/v1.4.0/starfall-1.4.0.zip`) for `download_url`, so an
+archive URL always means one exact build.
+
+Your CDN is untrusted by design. It cannot alter the archive without breaking
+the checksum, or the manifest without breaking the signature.
+
+## Offering more than one version
+
+By default users get `latest_version`. To let them look through what you offer
+and pick — `hermes versions <id>`, or `v` in the interactive list — add a
+`versions` array to the payload:
+
+```json
+"versions": [
+  {
+    "version": "1.3.2",
+    "download_url": "https://github.com/moonforge/starfall/releases/download/v1.3.2/starfall-1.3.2.zip",
+    "checksum_sha256": "3b8c...",
+    "size_bytes": 701000000,
+    "release_notes": "- The release before the expansion"
+  }
+]
+```
+
+Each entry carries its own URL, checksum, size and notes, and the whole list is
+covered by the same signature — so an older release is offered on **your**
+authority, not your CDN's. The latest release is described by the top-level
+fields and must not be repeated in the list.
+
+Users install one with:
+
+```sh
+hermes versions starfall                  # look at what is on offer
+hermes update starfall --version 1.3.2    # install that one
+```
+
+Going *backwards* is a separate decision from granting folder access, so
+`--yes` does not cover it — HERMES warns and asks, and `--allow-downgrade`
+answers it in a script. Keep old entries listed only while the archives are
+still up; an entry pointing at a deleted file is a broken option in a menu.
+
+## Shipping for several platforms
+
+When each platform needs a different binary, use `platforms` instead of one
+`download_url`:
+
+```json
+"platforms": {
+  "windows-x86_64": { "download_url": "...-windows.zip", "checksum_sha256": "...", "size_bytes": 1234 },
+  "linux-x86_64":   { "download_url": "...-linux.zip",   "checksum_sha256": "...", "size_bytes": 1234 },
+  "macos-aarch64":  { "download_url": "...-macos.zip",   "checksum_sha256": "...", "size_bytes": 1234 }
+}
+```
+
+Keys are `<os>-<arch>` using Rust's names (`windows`, `linux`, `macos`;
+`x86_64`, `aarch64`). The entry for the running platform wins; the top-level
+fields stay as the fallback for anything portable. A manifest that lists
+platforms but not the user's is an error rather than a silent fallback —
+quietly installing another platform's binary is worse than saying there is no
+build. Catalogue entries under `versions` take their own `platforms` map too.
+
+`tools/release.py` in this repository builds, packages, checksums and signs in
+one command, accumulating the `platforms` map as you build on each machine.
+It is worth reading even if you write your own.
+
+## Patching software HERMES did not install
+
+If your users already have your software — bought elsewhere, unzipped by hand,
+installed years before you adopted HERMES — HERMES does not know where it is.
+Your plan can ask:
+
+```toml
+[locate]
+prompt = "Where is Starfall installed?"
+expect = "bin/starfall.exe"
+```
+
+That is the whole of what you may say. **You do not name the folder.** The user
+types or drags it in, and HERMES refuses anything that is not an existing
+folder containing `expect` — and refuses drive roots, their home directory and
+its parents outright. Your declared scope is then resolved against whatever
+they chose and shown to them before they approve it.
+
+Always set `expect`: it is what turns "some folder" into "the right folder",
+and without it a mistyped path gets patched instead of refused. The answer is
+remembered, so this is asked once per user rather than once per update.
+
+## If your software needs an account
+
+HERMES never sees your users' credentials and holds no client secret. Your
+website does the login; HERMES catches the result on loopback.
+
+Set both fields in your `.origin`:
+
+```toml
+studio_auth_url = "https://moonforge.dev/hermes/login"
+requires_auth   = true
+```
+
+Then:
+
+1. `hermes login starfall` binds `127.0.0.1:8080` and opens
+   `<studio_auth_url>?port=8080&state=<random>&client=hermes&redirect_uri=http://127.0.0.1:8080/callback`
+2. Your backend authenticates however you like — Patreon, Steam, itch.io, your
+   own password form. None of it involves HERMES.
+3. You redirect the browser to
+   `http://127.0.0.1:<port>/callback?token=<JWT>&state=<the same state, echoed back verbatim>`
+4. HERMES checks the `state`, stores the token with owner-only permissions, and
+   shuts the server down.
+5. Every later manifest and archive request carries
+   `Authorization: Bearer <token>`. Your CDN or edge worker checks it.
+
+Read the port from the query string rather than assuming 8080 — if it is taken,
+HERMES binds another and tells you which. Echo `state` back exactly; a mismatch
+is treated as CSRF and the token is discarded.
+
+The token is opaque to HERMES. It checks structure and expiry (`exp`) and
+nothing else — the signature is yours to verify, because the key is yours.
+
+## Rotating a key
+
+Users pin your key on first add. If you publish a `.origin` with a different
+one, HERMES stops and makes them confirm the change explicitly, showing both
+keys. That is deliberate: a swapped key is what a supply-chain compromise looks
+like, and it should never be silent.
+
+So rotate rarely, and when you do:
+
+1. Announce it somewhere users can check independently — your site, your
+   release notes, wherever they already trust you.
+2. Publish the new `.origin`.
+3. Expect them to be asked. Tell them what the new key's first characters are
+   so they can compare.
+
+There is no revocation, because there is nobody to revoke through. The pin is
+the authority, which is the point of the design and also its sharpest edge.
 
 ## Release checklist
 
-1. `cargo test` and `python tools/e2e_test.py` both clean.
-2. `cargo build --release` — confirm the binary runs and `--version` is right.
-3. If icons changed: `python tools/gen_icons.py`, eyeball
-   `assets/icons/contact-sheet.png` at real sizes, then rebuild to re-embed.
-4. Bump `version` in `Cargo.toml`; commit `Cargo.lock`.
-5. If a document format changed incompatibly, bump its `schema` string
-   (`hermes.origin/v1` → `/v2`) and reject the old one explicitly rather than
-   parsing it loosely.
+1. Bump `version` in your `.foiled`; it must match `latest_version`.
+2. `hermes inspect update.foiled` — read the scope as a user would.
+3. Build the archive; `hermes studio checksum` it.
+4. Write the payload with a fresh `issued_at` and real `release_notes`.
+5. `hermes studio sign`.
+6. `hermes studio verify --origin ... --manifest ...`.
+7. Upload the archive **first**, then the manifest. A manifest pointing at a
+   file that is not there yet is a broken update for anyone checking in
+   between.
+8. Test it end to end from a machine that has never seen the release: `hermes
+   add` your published `.origin`, then `hermes update`.
+
+Step 8 is the one worth not skipping. It is the only check that covers your
+actual URLs, your actual archive and your actual signature together.

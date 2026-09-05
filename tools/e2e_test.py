@@ -247,6 +247,43 @@ def main():
     serve_dir = WORK / "serve"
 
     print("\n== studio side ==")
+
+    # The templates a studio actually starts from. A template that does not
+    # survive `inspect` is worse than no template at all.
+    hermes("studio", "template", "origin", "--out", WORK / "template.origin")
+    hermes("studio", "template", "foiled", "--out", WORK / "template.foiled")
+    origin_tpl = tomllib.loads((WORK / "template.origin").read_text(encoding="utf-8"))
+    check("the .origin template is a valid document",
+          "Starfall" in hermes("inspect", WORK / "template.origin").stdout)
+    check("the .origin template names no local path",
+          "install_dir" not in origin_tpl, origin_tpl)
+    check("the .foiled template is a valid plan",
+          "requested folder scope" in hermes("inspect", WORK / "template.foiled").stdout)
+    clobber = hermes("studio", "template", "origin", "--out", WORK / "template.origin",
+                     expect=None)
+    check("a template refuses to overwrite an edited one",
+          clobber.returncode != 0 and "already exists" in (clobber.stdout + clobber.stderr),
+          clobber.stdout + clobber.stderr)
+
+    # A .origin saved by Notepad or re-encoded by a webserver carries a UTF-8
+    # BOM. It is valid UTF-8, so it used to reach the TOML parser and fail at
+    # line 1 column 1 on a line that reads perfectly.
+    bom_origin = WORK / "bom.origin"
+    bom_origin.write_bytes(b"\xef\xbb\xbf" + (WORK / "template.origin").read_bytes())
+    bom = hermes("inspect", bom_origin, expect=None)
+    check("a .origin with a byte-order mark still parses",
+          bom.returncode == 0 and "Starfall" in bom.stdout, bom.stdout + bom.stderr)
+
+    # A path dragged into a shell unquoted arrives as several arguments.
+    spaced = WORK / "My Studio Folder"
+    spaced.mkdir()
+    shutil.copy(WORK / "template.origin", spaced / "dragged.origin")
+    split = hermes("add", *str(spaced / "dragged.origin").split(" "), expect=None)
+    check("a path the shell split on spaces is put back together",
+          split.returncode == 0 and "Starfall" in split.stdout,
+          split.stdout + split.stderr)
+    hermes("remove", "moonforge.starfall", expect=None)
+
     hermes("studio", "keygen", "--id", "demo.game", "--out", WORK / "keys")
     key = WORK / "keys" / "demo.game.key"
     check("keygen wrote a key file", key.exists())
@@ -400,6 +437,165 @@ def main():
 
         hermes("logout", "demo.game")
         check("logout removes the token", not token_file.exists())
+
+        # ---- a plan that patches software HERMES did not install -------
+        #
+        # The folder is something only the user knows, so the plan asks. It
+        # never names the folder itself; it says what it expects to find in
+        # the one the user gives.
+        # ---- previewing and choosing a version -------------------------
+        #
+        # The catalogue is part of the signed payload, so an older release is
+        # offered on the studio's authority rather than the CDN's.
+        print("\n== choosing a version ==")
+        old_pkg = WORK / "old-pkg"
+        (old_pkg / "bin").mkdir(parents=True)
+        (old_pkg / "bin" / "game.bin").write_text("VERSION 1.0.5", encoding="utf-8")
+        (old_pkg / "update.foiled").write_text(
+            foiled_toml(version="1.0.5").replace(
+                '[[steps]]\naction  = "extract_zip"\narchive = "content.zip"\ndest    = "data"\n', ""
+            ).replace(
+                '[[steps]]\naction    = "delete"\npath      = "data/old.pak"\nrecursive = false\n', ""
+            ),
+            encoding="utf-8")
+        old_zip = serve_dir / "release-1.0.5.zip"
+        zip_dir(old_pkg, old_zip)
+        old_digest, old_size = sha_and_size(old_zip)
+
+        catalogue = payload | {
+            "versions": [{
+                "version": "1.0.5",
+                "download_url": f"http://127.0.0.1:{PORT}/release-1.0.5.zip",
+                "checksum_sha256": old_digest,
+                "size_bytes": old_size,
+                "release_notes": "- the version before the expansion",
+            }],
+        }
+        sign(catalogue, key, serve_dir / "manifest.json")
+
+        listed = hermes("versions", "demo.game")
+        check("versions lists every release the studio offers",
+              "1.1.0" in listed.stdout and "1.0.5" in listed.stdout, listed.stdout)
+        check("versions marks the latest and the installed one",
+              "[latest, installed]" in listed.stdout, listed.stdout)
+        check("versions shows each release's own notes",
+              "the version before the expansion" in listed.stdout, listed.stdout)
+
+        # Picking an older one is a downgrade: --yes must NOT be enough.
+        refused = hermes("update", "demo.game", "--version", "1.0.5", "--yes", expect=None)
+        check("an older version is refused without --allow-downgrade",
+              refused.returncode == 2 and "--allow-downgrade" in (refused.stdout + refused.stderr),
+              refused.stdout + refused.stderr)
+        check("the refusal left the newer version installed",
+              (install / "bin" / "game.bin").read_text(encoding="utf-8") == "VERSION 1.1.0")
+
+        picked = hermes("update", "demo.game", "--version", "1.0.5", "--yes",
+                        "--allow-downgrade")
+        check("a chosen older version installs its own artifact",
+              (install / "bin" / "game.bin").read_text(encoding="utf-8") == "VERSION 1.0.5",
+              picked.stdout)
+        state = json.loads((WORK / "home" / "state" / "demo.game.json").read_text(encoding="utf-8"))
+        check("the chosen version is what gets recorded",
+              state.get("installed_version") == "1.0.5", state)
+
+        missing = hermes("update", "demo.game", "--version", "3.3.3", expect=None)
+        check("a version the studio does not offer says what it does",
+              "does not offer 3.3.3" in (missing.stdout + missing.stderr),
+              missing.stdout + missing.stderr)
+
+        # Back to the newest, so the attack battery below starts where it did.
+        hermes("update", "demo.game", "--yes")
+        check("updating without --version goes back to the newest",
+              (install / "bin" / "game.bin").read_text(encoding="utf-8") == "VERSION 1.1.0")
+        sign(payload, key, serve_dir / "manifest.json")
+
+        print("\n== [locate]: patching an existing installation ==")
+        patch_key = WORK / "keys" / "demo.editor.key"
+        hermes("studio", "keygen", "--id", "demo.editor", "--out", WORK / "keys")
+
+        # An installation that arrived some other way entirely, nowhere near
+        # HERMES's own directories.
+        preinstalled = WORK / "elsewhere" / "CoolEditor"
+        (preinstalled / "bin").mkdir(parents=True)
+        (preinstalled / "bin" / "editor.exe").write_text("VERSION 2.0.0", encoding="utf-8")
+        (preinstalled / "projects").mkdir()
+        (preinstalled / "projects" / "mine.proj").write_text("my work", encoding="utf-8")
+
+        patch_pkg = WORK / "patch-pkg"
+        (patch_pkg / "bin").mkdir(parents=True)
+        (patch_pkg / "bin" / "editor.exe").write_text("VERSION 2.1.0", encoding="utf-8")
+        (patch_pkg / "update.foiled").write_text('''schema    = "hermes.foiled/v1"
+origin_id = "demo.editor"
+version   = "2.1.0"
+base      = "clone"
+
+[locate]
+prompt = "Where is Cool Editor installed?"
+expect = "bin/editor.exe"
+
+[[scope]]
+path      = "bin"
+recursive = true
+access    = "write"
+reason    = "replace the editor executable"
+
+[[steps]]
+action = "copy"
+from   = "bin/editor.exe"
+to     = "bin/editor.exe"
+''', encoding="utf-8")
+        patch_zip = serve_dir / "editor.zip"
+        zip_dir(patch_pkg, patch_zip)
+        patch_digest, patch_size = sha_and_size(patch_zip)
+        patch_payload = {
+            "schema": "hermes.manifest/v1",
+            "origin_id": "demo.editor",
+            "latest_version": "2.1.0",
+            "download_url": f"http://127.0.0.1:{PORT}/editor.zip",
+            "checksum_sha256": patch_digest,
+            "size_bytes": patch_size,
+            "issued_at": int(time.time()),
+        }
+        sign(patch_payload, patch_key, serve_dir / "editor-manifest.json")
+        hermes("studio", "new-origin", "--key", patch_key, "--name", "Cool Editor",
+               "--publisher", "Cool Software", "--homepage", "https://cool.example",
+               "--manifest-url", f"http://127.0.0.1:{PORT}/editor-manifest.json",
+               "--out", WORK / "editor.origin")
+        editor_origin = tomllib.loads((WORK / "editor.origin").read_text(encoding="utf-8"))
+        check("origin carries the creator and the home page",
+              editor_origin.get("publisher") == "Cool Software"
+              and editor_origin.get("homepage") == "https://cool.example",
+              editor_origin)
+
+        inspected = hermes("inspect", patch_pkg / "update.foiled")
+        check("inspect warns that the plan will ask where the software is",
+              "will ask where the software is installed" in inspected.stdout
+              and "bin/editor.exe" in inspected.stdout, inspected.stdout)
+
+        hermes("add", WORK / "editor.origin")
+
+        # No terminal to ask on, so it denies rather than guessing a folder.
+        blind = hermes("update", "demo.editor", "--yes", expect=None)
+        check("a plan that must ask is refused without a terminal",
+              blind.returncode == 2 and "--install-dir" in (blind.stdout + blind.stderr),
+              blind.stdout + blind.stderr)
+        check("the untouched installation is still on the old version",
+              (preinstalled / "bin" / "editor.exe").read_text(encoding="utf-8") == "VERSION 2.0.0")
+
+        # --install-dir answers the same question up front.
+        patched = hermes("update", "demo.editor", "--yes", "--install-dir", preinstalled)
+        check("the update lands in the folder that was named, not a default",
+              (preinstalled / "bin" / "editor.exe").read_text(encoding="utf-8") == "VERSION 2.1.0",
+              patched.stdout)
+        check("files outside the plan's scope survive the swap",
+              (preinstalled / "projects" / "mine.proj").read_text(encoding="utf-8") == "my work")
+        check("nothing was installed into the default location",
+              not (WORK / "home" / "apps" / "demo.editor").exists())
+        editor_state = json.loads(
+            (WORK / "home" / "state" / "demo.editor.json").read_text(encoding="utf-8"))
+        check("the folder is remembered, so it is asked once",
+              Path(editor_state.get("install_dir", "")).resolve() == preinstalled.resolve(),
+              editor_state)
 
         print("\n== attacks ==")
         # 1. Tampered manifest: flip the version, keep the signature.

@@ -1,0 +1,80 @@
+# ---------------------------------------------------------------------------
+# HERMES origin file - a template. Copy it, edit it, hand it to your users.
+#
+# What this file is: an ADDRESS. It tells HERMES where your updates live and
+# which key signs them. That is all.
+#
+# What this file is NOT: anything to do with the user's disk. There is no
+# install path here, no folder name, nothing local. Where files end up is the
+# update's business (see update.foiled), not the origin's.
+#
+# Users add it with:   hermes add starfall.origin
+# or by dragging it onto the HERMES window. Check yours with:
+#                      hermes inspect starfall.origin
+# ---------------------------------------------------------------------------
+
+schema = "hermes.origin/v1"
+
+# Stable identity. Lowercase a-z, 0-9, '.', '-' and '_'. It is also the
+# filename in the user's registry, so pick it once and never change it -
+# changing it makes every existing user look like a new application.
+id = "moonforge.starfall"
+
+# Shown in listings and in the permission prompt.
+name = "Starfall"
+
+# Who made it, and where to read about it. Both optional, both shown to the
+# user. They are claims, not credentials: only public_key decides what HERMES
+# will actually install.
+publisher = "Moonforge Games"
+homepage  = "https://moonforge.dev"
+
+# ---------------------------------------------------------------------------
+# Where the updates are
+# ---------------------------------------------------------------------------
+#
+# The signed manifest. Must be https (or loopback http while you are testing
+# with HERMES_ALLOW_INSECURE_HTTP=1). Anything that serves bytes will do -
+# HERMES trusts the signature, never the host.
+#
+# A GitHub repository is a perfectly good home for it. `latest` resolves to
+# whatever your newest release is, so this URL never has to change:
+upstream_manifest_url = "https://github.com/moonforge/starfall/releases/latest/download/manifest.json"
+
+# Your own CDN works exactly the same way:
+# upstream_manifest_url = "https://cdn.moonforge.dev/starfall/manifest.json"
+
+# ---------------------------------------------------------------------------
+# The trust anchor
+# ---------------------------------------------------------------------------
+#
+# Ed25519 public key, base64 or hex. Every update HERMES installs for this
+# application must be signed by the matching private key. A CDN, a mirror or
+# anything on the network in between can serve whatever it likes; without this
+# signature it means nothing.
+#
+# REPLACE THIS. Generate your own pair with:
+#
+#     hermes studio keygen --id moonforge.starfall --out ~/.hermes-keys
+#
+# which prints the public half to paste here and writes the private half to a
+# .key file. Keep that file offline and never commit it - anyone holding it can
+# sign updates that every one of your users will install.
+#
+# The key below is a placeholder whose private half was thrown away, so an
+# unedited template fails loudly instead of installing anything.
+public_key = "E1gn4e0GNLsulSLZhG/CvSJGlTVkDDGYNMVy9Ut2W4A="
+
+# ---------------------------------------------------------------------------
+# Optional: studio accounts
+# ---------------------------------------------------------------------------
+#
+# Only if updates are behind a login. `hermes login` opens this page in the
+# user's browser with a ?port= parameter, and your page redirects back to
+# http://localhost:<port>/callback?token=...&state=... when they have signed
+# in. HERMES then attaches that token as a Bearer header when it fetches your
+# manifest and archives.
+#
+# Delete both lines if your downloads are public.
+studio_auth_url = "https://moonforge.dev/hermes/login"
+requires_auth   = true

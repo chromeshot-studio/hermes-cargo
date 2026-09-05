@@ -9,15 +9,20 @@
 //!  4. stream .zip -> .staging, hashing in flight, never in RAM
 //!  5. compare digest to the signed checksum   <- nothing is unpacked before this
 //!  6. extract into staging   <- Zip-Slip sandbox
-//!  7. read the .foiled plan, enforce its declared scope
-//!  8. ask the user for the scope, verbatim
-//!  9. build the new tree in staging
-//! 10. rename the new tree into place
+//!  7. read the .foiled plan
+//!  8. if the plan asks, find out where the software is installed
+//!  9. enforce the plan's declared scope against that folder
+//! 10. ask the user for the scope, verbatim
+//! 11. build the new tree in staging
+//! 12. rename the new tree into place
 //! ```
 //!
-//! The live install directory is not touched at all until step 10, and step 10
+//! The live install directory is not touched at all until step 12, and step 12
 //! is two renames. A crash, a power cut or a `Ctrl-C` anywhere before it leaves
 //! the installed application exactly as it was.
+//!
+//! Step 8 answers "which folder?", never "may I?" - the folder comes from the
+//! user, and steps 9 and 10 then run against it unchanged.
 
 use crate::auth;
 use crate::error::SecurityError;
@@ -43,6 +48,12 @@ pub struct UpdateOptions {
     pub install_dir: Option<PathBuf>,
     /// Re-apply even when the installed version already matches.
     pub force: bool,
+    /// Install this version instead of the newest one on offer.
+    pub version: Option<semver::Version>,
+    /// Permit an explicitly chosen version that is older than the installed
+    /// one. Deliberately separate from `assume_yes`: granting folder access
+    /// and accepting a downgrade are two different decisions.
+    pub allow_downgrade: bool,
 }
 
 pub struct Available {
@@ -172,6 +183,22 @@ impl Staging {
             same_volume,
         })
     }
+
+    /// Move this job next to a different install directory.
+    ///
+    /// A plan's `[locate]` block can only be answered *after* the archive has
+    /// been unpacked, and by then staging is sitting beside the folder we
+    /// guessed. Since the final swap is a rename only while staging shares a
+    /// volume with the install directory, a wrong guess moves the whole job
+    /// rather than letting the swap quietly degrade into a copy.
+    ///
+    /// Consumes the old staging area, so its `Drop` clears what is left of it.
+    fn relocate(self, install_dir: &Path, origin_id: &str) -> Result<Self> {
+        let fresh = Staging::create(install_dir, origin_id)?;
+        fsx::move_path(&self.payload, &fresh.payload)
+            .context("moving the verified payload next to the chosen folder")?;
+        Ok(fresh)
+    }
 }
 
 impl Drop for Staging {
@@ -194,27 +221,48 @@ pub fn apply(
     opts: &UpdateOptions,
 ) -> Result<()> {
     let manifest = &available.manifest;
-    let offered = manifest.version()?;
 
-    crypto::assert_no_rollback(available.installed.as_ref(), &offered)?;
-    if !available.is_newer && !opts.force {
-        println!(
-            "  {} {} is already installed.",
-            origin.name, offered
-        );
+    // Which release: the newest on offer, or the one the user named.
+    let target = match &opts.version {
+        Some(want) => manifest.release(want)?,
+        None => manifest.latest_release()?,
+    };
+    let offered = target.version.clone();
+
+    if opts.version.is_some() {
+        // The user picked this version themselves, so an older one is a
+        // deliberate choice rather than a CDN pinning them on a stale build.
+        // It still has to be said out loud - that is what the anti-rollback
+        // rule is protecting, and `--yes` does not cover it.
+        if let Some(installed) = &available.installed {
+            if offered < *installed {
+                consent::confirm_downgrade(
+                    &origin.name,
+                    installed,
+                    &offered,
+                    opts.allow_downgrade,
+                )?;
+            }
+        }
+    } else {
+        crypto::assert_no_rollback(available.installed.as_ref(), &offered)?;
+    }
+
+    if available.installed.as_ref() == Some(&offered) && !opts.force {
+        println!("  {} {} is already installed.", origin.name, offered);
         return Ok(());
     }
 
     let mut state = registry::load_state(&origin.id)?;
-    let install_dir = match &opts.install_dir {
+    let mut install_dir = match &opts.install_dir {
         Some(dir) => dir.clone(),
         None => registry::install_dir_for(origin, &state)?,
     };
 
-    let staging = Staging::create(&install_dir, &origin.id)?;
+    let mut staging = Staging::create(&install_dir, &origin.id)?;
 
     // ---- 1. stream the archive to disk, hashing on the fly ---------------
-    let artifact = manifest.artifact()?;
+    let artifact = target.artifact()?;
     println!(
         "  downloading {} {} ({}{})",
         origin.name,
@@ -263,18 +311,40 @@ pub fn apply(
         }
         .into());
     }
-    if plan.version != manifest.latest_version {
+    // The plan must match the release we actually asked for, not merely the
+    // newest one: otherwise a studio could serve the 1.4.0 archive from the
+    // 1.2.0 catalogue entry and the mismatch would go unnoticed.
+    if plan.version != offered.to_string() {
         bail!(
-            "the plan inside the archive is for version {} but the signed manifest says {}",
-            plan.version,
-            manifest.latest_version
+            "the plan inside the archive is for version {} but the signed manifest \
+             offers it as {offered}",
+            plan.version
         );
     }
 
-    // ---- 5. enforce the declared scope, then ask -------------------------
+    // ---- 5. find out where the software actually lives -------------------
+    //
+    // Only when the plan asks and HERMES does not already know. The answer is
+    // the user's, is checked before it is used, and is remembered afterwards -
+    // so this is asked once per application, not once per update. It happens
+    // before the scope is resolved so that the permission prompt below shows
+    // absolute paths under the folder the user actually named.
+    if let Some(locate) = &plan.locate {
+        if opts.install_dir.is_none() && state.install_dir.is_none() {
+            let suggestion = install_dir.is_dir().then(|| install_dir.clone());
+            let chosen =
+                consent::locate_install_dir(&origin.name, locate, suggestion.as_deref())?;
+            if chosen != install_dir {
+                staging = staging.relocate(&chosen, &origin.id)?;
+                install_dir = chosen;
+            }
+        }
+    }
+
+    // ---- 6. enforce the declared scope, then ask -------------------------
     let grants = consent::resolve_scope(&plan, &install_dir)?;
     consent::enforce_plan_scope(&plan, &grants)?;
-    let notes = manifest.display_notes();
+    let notes = target.display_notes();
     consent::request_consent(
         &origin.name,
         &plan,
@@ -284,7 +354,7 @@ pub fn apply(
         opts.assume_yes,
     )?;
 
-    // ---- 6. build the new tree in staging --------------------------------
+    // ---- 7. build the new tree in staging --------------------------------
     if plan.base == BaseTree::Clone && install_dir.exists() {
         println!("  cloning the current install into staging...");
         fsx::clone_tree(&install_dir, &staging.next)
@@ -292,7 +362,7 @@ pub fn apply(
     }
     execute_plan(&plan, &staging, &install_dir, &grants)?;
 
-    // ---- 7. swap ----------------------------------------------------------
+    // ---- 8. swap ----------------------------------------------------------
     let retired = swap_into_place(&install_dir, &staging.next, &staging.work, staging.same_volume)?;
     println!("  installed into {}", display_path(&install_dir));
 
@@ -310,7 +380,7 @@ pub fn apply(
         fsx::cleanup(&retired);
     }
 
-    // ---- 8. record ---------------------------------------------------------
+    // ---- 9. record ---------------------------------------------------------
     state.installed_version = Some(offered.to_string());
     state.install_dir = Some(install_dir.clone());
     registry::save_state(&origin.id, &state)?;

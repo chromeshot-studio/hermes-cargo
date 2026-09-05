@@ -1,0 +1,49 @@
+schema    = "hermes.foiled/v1"
+origin_id = "example.example"
+version   = "1.1.2"
+
+notes     = "example."
+
+# prompt = "Where is Starfall installed?"
+# expect = "bin/example.exe"
+
+[[scope]]
+path      = "bin"
+recursive = true
+access    = "write"
+reason    = "example"
+
+[[scope]]
+path      = "saves"
+recursive = true
+access    = "read"
+reason    = "example"
+
+[[scope]]
+path      = "data"
+recursive = true
+access    = "delete"
+reason    = "example"
+
+[[steps]]
+action = "backup"
+path   = "saves"
+
+[[steps]]
+action = "preserve"
+path   = "saves"
+
+[[steps]]
+action = "copy"
+from   = "bin/example.exe"
+to     = "bin/example.exe"
+
+[[steps]]
+action  = "extract_zip"
+archive = "content.zip"
+dest    = "data"
+
+[[steps]]
+action    = "delete"
+path      = "data/old-content.pak"
+recursive = false

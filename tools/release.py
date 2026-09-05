@@ -12,7 +12,7 @@ Linux produces one manifest covering both.
       hermes-0.2.0-windows-x86_64.zip
       payload.json      the manifest body, re-signed on every run
       manifest.json     <- upload this
-      hermes.origin     <- commit this; users add it by hand
+      hermes.origin     <- commit this; it is also compiled into the binary
 
 Then:
 
@@ -106,6 +106,8 @@ def main():
     parser.add_argument("--version", help="release version (default: Cargo.toml)")
     parser.add_argument("--key", type=Path, default=DEFAULT_KEY)
     parser.add_argument("--repo", default="chromeshot-studio/hermes")
+    parser.add_argument("--publisher", default="CHROMESHOT Studio")
+    parser.add_argument("--homepage", help="default: the GitHub repo page")
     parser.add_argument("--notes", type=Path, help="file with the release notes")
     parser.add_argument("--base-url", help="override the download base (for testing)")
     args = parser.parse_args()
@@ -120,6 +122,26 @@ def main():
     subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
 
     ensure_key(args.key)
+
+    # ---- the .origin, written BEFORE the build that ships --------------
+    #
+    # src/selfupdate.rs embeds this file with include_str!, so the binary a
+    # release contains has to be compiled *after* it is written. Getting this
+    # backwards ships a binary pinned to the previous key, and that only fails
+    # once it is in users' hands.
+    origin_path = ROOT / "hermes.origin"
+    before = origin_path.read_bytes() if origin_path.exists() else b""
+    manifest_url = (f"{args.base_url}/manifest.json" if args.base_url
+                    else f"https://github.com/{args.repo}/releases/latest/download/manifest.json")
+    hermes("studio", "new-origin", "--key", args.key, "--name", APP_NAME,
+           "--publisher", args.publisher,
+           "--homepage", args.homepage or f"https://github.com/{args.repo}",
+           "--manifest-url", manifest_url, "--out", origin_path)
+    if origin_path.read_bytes() != before:
+        print("  hermes.origin changed - rebuilding so the binary embeds it\n")
+        subprocess.run(["cargo", "build", "--release"], cwd=ROOT, check=True)
+    shutil.copy(origin_path, DIST / "hermes.origin")
+    print("  hermes.origin is compiled into the binary being packaged")
 
     # ---- package ------------------------------------------------------
     asset = f"hermes-{version}-{platform_key()}.zip"
@@ -180,15 +202,6 @@ def main():
     print(f"  signed manifest.json  ({len(platforms)} platform(s): "
           f"{', '.join(sorted(platforms))})")
 
-    # ---- the .origin users add ----------------------------------------
-    origin_path = DIST / "hermes.origin"
-    manifest_url = (f"{args.base_url}/manifest.json" if args.base_url
-                    else f"https://github.com/{args.repo}/releases/latest/download/manifest.json")
-    hermes("studio", "new-origin", "--key", args.key, "--name", APP_NAME,
-           "--manifest-url", manifest_url, "--out", origin_path)
-    shutil.copy(origin_path, ROOT / "hermes.origin")
-    print(f"  wrote {origin_path.name} (also copied to the repository root)")
-
     verify = hermes("studio", "verify", "--origin", origin_path,
                     "--manifest", DIST / "manifest.json")
     print("  " + verify.stdout.strip().splitlines()[0])
@@ -201,13 +214,16 @@ def main():
     git tag v{version} && git push --tags && git push
 
     gh release create v{version} \\
-        dist/manifest.json {archive.relative_to(ROOT).as_posix()} \\
+        dist/manifest.json dist/hermes.origin \\
+        {archive.relative_to(ROOT).as_posix()} \\
         --title "HERMES {version}"
 
-  Users then run, once:
+  Users on an older build then run:
 
-    hermes add hermes.origin
     hermes self-update
+
+  Nothing to add by hand - hermes.origin is compiled into the binary, so a
+  fresh install already knows where its own updates live.
 """)
     return 0
 

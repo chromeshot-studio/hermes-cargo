@@ -13,6 +13,7 @@
 use crate::error::SecurityError;
 use crate::paths;
 use crate::schema::{validate_id, OriginFile};
+use crate::security::safepath::display_path;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -61,10 +62,20 @@ fn state_path(id: &str) -> Result<PathBuf> {
 
 /// Read a `.origin` from anywhere on disk (the dropped file).
 pub fn read_origin_file(path: &Path) -> Result<OriginFile> {
-    let meta = fs::metadata(path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let meta = fs::metadata(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "there is no file at {}\n         \
+                 If you dragged it in, drop the file onto the prompt without \
+                 typing anything else first.",
+                display_path(path)
+            )
+        } else {
+            anyhow!("cannot read {}: {e}", display_path(path))
+        }
+    })?;
     if !meta.is_file() {
-        bail!("{} is not a file", path.display());
+        bail!("{} is not a file", display_path(path));
     }
     // A .origin is a small TOML document; anything large is not one.
     if meta.len() > 64 * 1024 {
@@ -191,18 +202,19 @@ pub fn resolve_id(needle: &str) -> Result<OriginFile> {
     }
 }
 
-/// Where an origin's files live. Studios may suggest a folder name; the user's
-/// `--install-dir` always wins, and the resolved path is remembered.
+/// Where an origin's files live.
+///
+/// A `.origin` deliberately has no say in this - it is an address updates come
+/// from, not a location on the user's disk. So: whatever was used last time,
+/// otherwise a folder named after the id under HERMES's own install root. A
+/// plan that needs somewhere else says so with `[locate]`, and `--install-dir`
+/// overrides everything.
 pub fn install_dir_for(origin: &OriginFile, state: &OriginState) -> Result<PathBuf> {
     if let Some(dir) = &state.install_dir {
         return Ok(dir.clone());
     }
-    let name = origin
-        .install_dir
-        .clone()
-        .unwrap_or_else(|| origin.id.clone());
-    let relative = crate::security::safepath::sanitize_relative(&name)
-        .map_err(|e| anyhow!("install_dir is unsafe: {e}"))?;
+    let relative = crate::security::safepath::sanitize_relative(&origin.id)
+        .map_err(|e| anyhow!("origin id is unusable as a folder name: {e}"))?;
     Ok(paths::default_install_root()?.join(relative))
 }
 
@@ -217,6 +229,12 @@ pub fn install_dir_for(origin: &OriginFile, state: &OriginState) -> Result<PathB
 /// spaces with a backslash. All three arrive here as plain argv strings.
 pub fn normalize_dropped_path(raw: &str) -> PathBuf {
     let mut s = raw.trim().to_string();
+
+    // PowerShell turns a dropped path containing spaces into a call:
+    // `& 'C:\Program Files\...'`. Drop the call operator and keep the path.
+    if let Some(rest) = s.strip_prefix("& ") {
+        s = rest.trim_start().to_string();
+    }
 
     // Surrounding quotes from a drag-and-drop or a copied path.
     for quote in ['"', '\''] {
@@ -312,6 +330,14 @@ mod tests {
     fn decodes_file_uris() {
         let p = normalize_dropped_path("file:///home/u/My%20Game/game.origin");
         assert!(p.to_string_lossy().contains("My Game"));
+    }
+
+    #[test]
+    fn strips_the_powershell_call_operator() {
+        assert_eq!(
+            normalize_dropped_path("& 'C:\\Program Files\\Starfall\\game.origin'"),
+            PathBuf::from("C:\\Program Files\\Starfall\\game.origin")
+        );
     }
 
     #[test]

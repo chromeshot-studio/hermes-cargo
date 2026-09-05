@@ -76,6 +76,15 @@ enum Command {
         /// Limit to one application (default: all of them)
         id: Option<String>,
     },
+    /// Show every version a studio offers, with its release notes
+    #[command(alias = "releases")]
+    Versions {
+        /// Application to look at
+        id: String,
+        /// Print the full release notes for each version
+        #[arg(long)]
+        notes: bool,
+    },
     /// Download, verify and apply an update
     Update(UpdateArgs),
     /// Sign in on the studio's own website via a localhost callback
@@ -143,6 +152,20 @@ struct UpdateArgs {
     /// Re-apply even if the installed version already matches
     #[arg(long)]
     force: bool,
+    /// Install this exact version instead of the newest (see `hermes versions`)
+    #[arg(long, value_name = "VERSION")]
+    version: Option<String>,
+    /// Accept a chosen version older than the installed one
+    #[arg(long)]
+    allow_downgrade: bool,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TemplateKind {
+    /// The trust root a user adds: identity, and the address updates come from
+    Origin,
+    /// The plan that ships inside a release archive: what to install, and how
+    Foiled,
 }
 
 #[derive(Args, Clone, Copy)]
@@ -179,14 +202,30 @@ enum StudioCommand {
     NewOrigin {
         #[arg(long)]
         key: PathBuf,
+        /// Display name of the application
         #[arg(long)]
         name: String,
+        /// Who made it - shown wherever the application is listed
+        #[arg(long)]
+        publisher: Option<String>,
+        /// The application's home page
+        #[arg(long)]
+        homepage: Option<String>,
         #[arg(long)]
         manifest_url: String,
         #[arg(long)]
         auth_url: Option<String>,
         #[arg(long)]
         requires_auth: bool,
+        #[arg(long, default_value = "-")]
+        out: PathBuf,
+    },
+    /// Write a commented starter .origin or .foiled to copy and edit
+    Template {
+        /// Which document to write
+        #[arg(value_enum)]
+        kind: TemplateKind,
+        /// Where to write it ("-" for stdout)
         #[arg(long, default_value = "-")]
         out: PathBuf,
     },
@@ -268,6 +307,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Inspect { path, .. } => cmd_inspect(&path),
         Command::Open { path, .. } => cmd_open(&path),
         Command::Check { id } => cmd_check(id.as_deref()),
+        Command::Versions { id, notes } => cmd_versions(&id, notes),
         Command::Update(args) => cmd_update(args),
         Command::Login { id, yes } => cmd_login(&id, yes),
         Command::Logout { id } => cmd_logout(&id),
@@ -320,11 +360,45 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         inputs.push(prompt_for_drop()?);
     }
 
-    for raw in inputs {
+    for raw in rejoin_split_path(inputs) {
         let path = registry::normalize_dropped_path(&raw);
         add_one(&path, args.force)?;
     }
     Ok(())
+}
+
+/// Put back together a path the shell tore apart.
+///
+/// Dragging a file onto a terminal pastes its path unquoted in a good number
+/// of them. `C:\Program Files\Starfall\game.origin` then reaches us as three
+/// arguments, none of which is a file, and the user is told that
+/// `C:\Program` does not exist - which is true, and useless.
+///
+/// So: if the arguments joined back together with spaces name a file that
+/// exists, that is what was dragged in. Checking existence first is what keeps
+/// `hermes add a.origin b.origin` working - two real files are never rejoined.
+fn rejoin_split_path(inputs: Vec<String>) -> Vec<String> {
+    if inputs.len() < 2 {
+        return inputs;
+    }
+    let joined = inputs.join(" ");
+    if registry::normalize_dropped_path(&joined).is_file() {
+        return vec![joined];
+    }
+    // Not a file either way - but if none of the pieces is one on its own,
+    // this was almost certainly one split path rather than several files, and
+    // saying so beats reporting that `C:\Program` does not exist.
+    if !inputs
+        .iter()
+        .any(|raw| registry::normalize_dropped_path(raw).exists())
+    {
+        eprintln!(
+            "  note: this looks like one path that the shell split on its spaces:\n    \
+             {joined}\n  \
+             If you dragged it in, put quotes around it: hermes add \"{joined}\"\n"
+        );
+    }
+    inputs
 }
 
 /// The literal drag-and-drop gesture: the user drops the file onto a waiting
@@ -389,7 +463,10 @@ fn add_one(path: &Path, force: bool) -> Result<()> {
         origin.name,
         origin.id
     );
-    println!("    publisher : {}", origin.publisher.as_deref().unwrap_or("(not stated)"));
+    println!("    creator   : {}", origin.publisher.as_deref().unwrap_or("(not stated)"));
+    if let Some(homepage) = &origin.homepage {
+        println!("    home      : {homepage}");
+    }
     println!("    manifest  : {}", origin.upstream_manifest_url);
     println!("    signing key: {}", short_key(&origin.public_key));
     if origin.requires_auth {
@@ -466,6 +543,16 @@ fn cmd_inspect(raw: &str) -> Result<()> {
             if let Some(notes) = &plan.notes {
                 println!("    notes    : {notes}");
             }
+            if let Some(locate) = &plan.locate {
+                println!("\n    this plan will ask where the software is installed:");
+                if let Some(question) = locate.display_prompt() {
+                    println!("      \"{question}\"");
+                }
+                if let Some(expect) = &locate.expect {
+                    println!("      the folder you pick must contain: {expect}");
+                }
+                println!("      the scope below is measured from the folder you name.");
+            }
             println!("\n    requested folder scope:");
             for grant in &plan.scope {
                 println!(
@@ -491,7 +578,8 @@ fn cmd_inspect(raw: &str) -> Result<()> {
             println!("\n  .origin file");
             println!("    name      : {}", origin.name);
             println!("    id        : {}", origin.id);
-            println!("    publisher : {}", origin.publisher.as_deref().unwrap_or("(not stated)"));
+            println!("    creator   : {}", origin.publisher.as_deref().unwrap_or("(not stated)"));
+            println!("    home      : {}", origin.homepage.as_deref().unwrap_or("(not stated)"));
             println!("    manifest  : {}", origin.upstream_manifest_url);
             println!("    auth      : {}", origin.studio_auth_url.as_deref().unwrap_or("(none)"));
             println!("    key       : {}", short_key(&origin.public_key));
@@ -544,13 +632,68 @@ fn cmd_check(id: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn cmd_versions(id: &str, full_notes: bool) -> Result<()> {
+    let origin = registry::resolve_id(id)?;
+    let client = net::HttpClient::new()?;
+    let available = update::check(&client, &origin)?;
+    let releases = available.manifest.releases()?;
+    let installed = available.installed.clone();
+
+    println!("\n  {} - {} version(s) offered\n", origin.name, releases.len());
+    for release in &releases {
+        let mut tags = Vec::new();
+        if release.is_latest {
+            tags.push("latest".to_string());
+        }
+        if installed.as_ref() == Some(&release.version) {
+            tags.push("installed".to_string());
+        }
+        let size = match release.artifact() {
+            Ok(artifact) => net::human_bytes(artifact.size_bytes),
+            // A release with no build for this platform is worth showing -
+            // silently hiding it looks like the studio never published it.
+            Err(_) => "no build for this platform".into(),
+        };
+        println!(
+            "  {:<14} {:<28}{}",
+            release.version.to_string(),
+            size,
+            if tags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", tags.join(", "))
+            }
+        );
+        if let Some(notes) = release.display_notes() {
+            for line in notes.iter().take(if full_notes { usize::MAX } else { 2 }) {
+                println!("      {line}");
+            }
+        }
+    }
+    println!("\n  Install one with:  hermes update {} --version <version>\n", origin.id);
+    Ok(())
+}
+
 fn cmd_update(args: UpdateArgs) -> Result<()> {
     let client = net::HttpClient::new()?;
     let targets = targets_for(args.id.as_deref())?;
+    let wanted = args
+        .version
+        .as_deref()
+        .map(|raw| {
+            semver::Version::parse(raw)
+                .with_context(|| format!("--version '{raw}' is not a semantic version"))
+        })
+        .transpose()?;
+    if wanted.is_some() && targets.len() > 1 {
+        bail!("--version needs one application: try `hermes update <id> --version ...`");
+    }
     let options = update::UpdateOptions {
         assume_yes: args.yes,
         install_dir: args.install_dir.clone(),
         force: args.force,
+        version: wanted.clone(),
+        allow_downgrade: args.allow_downgrade,
     };
 
     let mut failures = 0;
@@ -564,7 +707,8 @@ fn cmd_update(args: UpdateArgs) -> Result<()> {
                 continue;
             }
         };
-        if !available.is_newer && !options.force {
+        // "Nothing newer" is not a reason to skip a version the user named.
+        if wanted.is_none() && !available.is_newer && !options.force {
             println!(
                 "  already on {}",
                 available
@@ -787,6 +931,8 @@ mod studio {
             StudioCommand::NewOrigin {
                 key,
                 name,
+                publisher,
+                homepage,
                 manifest_url,
                 auth_url,
                 requires_auth,
@@ -800,9 +946,8 @@ mod studio {
                     upstream_manifest_url: manifest_url,
                     studio_auth_url: auth_url,
                     public_key: key_file.public_key,
-                    publisher: None,
-                    homepage: None,
-                    install_dir: None,
+                    publisher,
+                    homepage,
                     requires_auth,
                 };
                 origin.validate()?;
@@ -813,6 +958,35 @@ mod studio {
                     std::fs::write(&out, &document)
                         .with_context(|| format!("writing {}", out.display()))?;
                     println!("  .origin written to {}", out.display());
+                }
+                Ok(())
+            }
+
+            StudioCommand::Template { kind, out } => {
+                let (document, suggested) = match kind {
+                    TemplateKind::Origin => (schema::ORIGIN_TEMPLATE, "starfall.origin"),
+                    TemplateKind::Foiled => (schema::FOILED_TEMPLATE, "update.foiled"),
+                };
+                if out == Path::new("-") {
+                    print!("{document}");
+                    return Ok(());
+                }
+                // A template is a starting point, so refuse to be the reason
+                // someone loses the edited version of one.
+                if out.exists() {
+                    bail!("{} already exists", display_path(&out));
+                }
+                std::fs::write(&out, document)
+                    .with_context(|| format!("writing {}", out.display()))?;
+                println!("\n  Wrote {}", display_path(&out));
+                println!("  Read the comments in it, then edit it.");
+                match kind {
+                    TemplateKind::Origin => println!(
+                        "  Replace the placeholder key: hermes studio keygen --id <your.id>\n"
+                    ),
+                    TemplateKind::Foiled => println!(
+                        "  It belongs at the root of your release archive as {suggested}.\n"
+                    ),
                 }
                 Ok(())
             }

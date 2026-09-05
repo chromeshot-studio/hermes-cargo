@@ -1,0 +1,22 @@
+# HERMES origin file
+#
+# Add it with:  hermes add <this file>   (or drag it into a terminal)
+#
+# This file points HERMES at the address updates come from. It says
+# nothing about your disk - no install path, no folder name.
+#
+# Every update HERMES installs for this application must be signed by
+# the public key below. Nothing else in this file is trusted: if the
+# URLs start serving something the key did not sign, the update stops.
+
+schema = "hermes.origin/v1"
+id = "chromeshot.hermes"
+name = "HERMES"
+publisher = "CHROMESHOT Studio"
+homepage = "https://github.com/chromeshot-studio/hermes"
+
+# Where the signed manifest lives - the studio's own CDN.
+upstream_manifest_url = "https://github.com/chromeshot-studio/hermes/releases/latest/download/manifest.json"
+
+# Ed25519 public key (base64). The trust anchor for this application.
+public_key = "SAEdznOCSFwumNpWwJSRhUkSLZ72ufJPITib5+4j2ac="

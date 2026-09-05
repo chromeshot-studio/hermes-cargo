@@ -56,9 +56,3 @@ That is nominative use and it is fine.
 | `src/`, `tools/` | MIT OR Apache-2.0 | do essentially anything |
 | `assets/` | CC BY 4.0 | reuse with attribution |
 | The name "HERMES" and its marks | reserved | refer to the project, not rebadge a fork |
-
-## A note on the copyright line
-
-The license files say `The HERMES Authors`. If you are the sole copyright
-holder, replace that with your legal name or entity in `LICENSE-MIT` and in the
-`Copyright` line before publishing.

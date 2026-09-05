@@ -2,10 +2,28 @@
 //!
 //! This is the project eating its own cooking: the HERMES repo is just another
 //! studio, GitHub Releases is just another CDN, and `hermes.origin` is a
-//! perfectly ordinary origin file that a user has to add by hand. **Nothing is
-//! compiled in.** There is still no default key in the binary, so a fresh
-//! build trusts nobody until someone drops in an `.origin` - the tool holds
-//! itself to the promise it makes to every other application.
+//! perfectly ordinary origin file - the same format any studio publishes.
+//!
+//! # The one key that is compiled in
+//!
+//! `hermes.origin` is embedded in the binary ([`SELF_ORIGIN`]), so
+//! `hermes self-update` works on a fresh install with nothing to add by hand.
+//!
+//! That is the *only* key in this binary, and it authorises exactly one thing:
+//! HERMES replacing itself. It is not a default trust root for anybody else's
+//! software - there is still no key list, no bundled publishers, and no way
+//! for this key to sign an update for an application you added. HERMES holds
+//! to the promise it makes about *other* people's software, which is the one
+//! that matters: a fresh build trusts nobody until you drop in an `.origin`.
+//!
+//! Embedding it adds no trust that is not already there. You are running this
+//! binary; it can already do anything you can. Telling it where its own updates
+//! live does not widen that, and pinning the key here means an update to HERMES
+//! is verified against a key that shipped *inside the thing being updated*
+//! rather than one fetched at the moment of use.
+//!
+//! A key rotation therefore travels with the update itself: the new binary
+//! carries the next `hermes.origin`.
 //!
 //! It cannot go through [`crate::update::apply`], though. That finishes with a
 //! directory rename, and Windows will not rename a directory containing a
@@ -36,6 +54,12 @@ use std::path::{Path, PathBuf};
 /// The origin id HERMES publishes for itself.
 pub const SELF_ORIGIN_ID: &str = "chromeshot.hermes";
 
+/// HERMES's own origin file, compiled in from the repository root.
+///
+/// `tools/release.py` regenerates this file *before* it builds, so the binary
+/// in a release always embeds the origin that release is published under.
+pub const SELF_ORIGIN: &str = include_str!("../hermes.origin");
+
 /// Suffix for the outgoing binary. It cannot be deleted while it is running.
 const RETIRED_SUFFIX: &str = ".old";
 
@@ -52,16 +76,45 @@ pub fn clean_previous() {
     }
 }
 
+/// The origin HERMES updates itself from.
+///
+/// Always the embedded one. A `chromeshot.hermes` entry in the registry is
+/// *not* consulted: a registry file is ordinary data on disk, and letting it
+/// redirect where the binary fetches its own replacement from would undo the
+/// point of pinning the key inside the binary. If one is there and disagrees,
+/// say so rather than silently ignoring it - the user put it there for a
+/// reason, and the two keys disagreeing is worth knowing about.
 fn self_origin() -> Result<OriginFile> {
-    registry::load_origin(SELF_ORIGIN_ID).map_err(|_| {
-        anyhow!(
-            "HERMES does not track itself yet.\n\n  \
-             Add its origin file once, the same way you would any other application:\n      \
-             hermes add hermes.origin\n\n  \
-             It ships in the repository and in every release. Nothing is compiled in: \
-             this tool trusts no key it was not given."
-        )
-    })
+    let origin = OriginFile::parse(SELF_ORIGIN.as_bytes()).map_err(|e| {
+        anyhow!("the origin file compiled into this build is not usable: {e:#}")
+    })?;
+    if origin.id != SELF_ORIGIN_ID {
+        bail!(
+            "the compiled-in origin is for '{}', not '{SELF_ORIGIN_ID}'",
+            origin.id
+        );
+    }
+    if let Ok(registered) = registry::load_origin(SELF_ORIGIN_ID) {
+        if registered.public_key != origin.public_key {
+            eprintln!(
+                "  note: a registered '{SELF_ORIGIN_ID}' origin pins a different key than\n  \
+                 this build does. Self-update uses the built-in one:\n    \
+                 built in  : {}\n    registered: {}",
+                short_key(&origin.public_key),
+                short_key(&registered.public_key)
+            );
+        }
+    }
+    Ok(origin)
+}
+
+fn short_key(key: &str) -> String {
+    let clean: String = key.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean.len() <= 16 {
+        clean
+    } else {
+        format!("{}...{}", &clean[..8], &clean[clean.len() - 8..])
+    }
 }
 
 /// Find the new binary inside the extracted payload.
@@ -140,7 +193,20 @@ pub fn run(client: &HttpClient, assume_yes: bool, check_only: bool) -> Result<()
     let running = semver::Version::parse(env!("CARGO_PKG_VERSION"))?;
 
     println!("\n  HERMES {running}");
-    let available = update::check(client, &origin)?;
+    let available = update::check(client, &origin).map_err(|e| {
+        // `releases/latest/download/...` 404s until the first release exists,
+        // which is exactly what a maintainer sees before publishing one. Say
+        // so rather than leaving them to guess at an HTTP status.
+        if format!("{e:#}").contains("404") {
+            e.context(
+                "no release has been published at that address yet \
+                 (`releases/latest/download/manifest.json` only resolves once a \
+                 release with those assets exists)",
+            )
+        } else {
+            e
+        }
+    })?;
     let offered = available.manifest.version()?;
 
     // The running binary is the truth here, not the registry: someone may have
@@ -293,5 +359,33 @@ mod tests {
         assert_eq!(fs::read(&current).unwrap(), b"new binary");
         assert_eq!(fs::read(&retired).unwrap(), b"old binary");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The compiled-in origin is what `self-update` trusts, so a bad commit to
+    /// `hermes.origin` must fail here rather than in a user's terminal.
+    #[test]
+    fn the_compiled_in_origin_is_usable() {
+        let origin = OriginFile::parse(SELF_ORIGIN.as_bytes())
+            .expect("hermes.origin at the repository root must be a valid .origin");
+        assert_eq!(origin.id, SELF_ORIGIN_ID);
+        assert!(
+            origin.upstream_manifest_url.starts_with("https://"),
+            "self-update must fetch over https: {}",
+            origin.upstream_manifest_url
+        );
+        // Points at the release the users get, not at a local test server.
+        assert!(
+            origin.upstream_manifest_url.contains("github.com"),
+            "expected the GitHub releases URL, got {}",
+            origin.upstream_manifest_url
+        );
+        // Parsing already decoded the key; this asserts it is really pinned.
+        assert!(!origin.public_key.is_empty());
+    }
+
+    #[test]
+    fn self_origin_reads_the_compiled_in_file() {
+        let origin = self_origin().expect("the built-in origin resolves");
+        assert_eq!(origin.id, SELF_ORIGIN_ID);
     }
 }

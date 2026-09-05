@@ -1,0 +1,8 @@
+schema = "hermes.origin/v1"
+name = "example"
+publisher = "Example Games"
+homepage  = "https://example.com"
+upstream_manifest_url = "https://github.com/moonforge/starfall/releases/latest/download/manifest.json"
+public_key = "examplekey123"
+studio_auth_url = "https://example.com/login"
+requires_auth   = true

@@ -21,7 +21,7 @@ use crate::install;
 use crate::net::HttpClient;
 use crate::paths;
 use crate::registry::{self, OriginState};
-use crate::schema::OriginFile;
+use crate::schema::{OriginFile, Release};
 use crate::security::safepath::display_path;
 use crate::update::{self, Available, UpdateOptions};
 use anyhow::{Context, Result};
@@ -31,7 +31,9 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{cursor, execute, queue};
+use std::collections::VecDeque;
 use std::io::{stdout, IsTerminal, Stdout, Write};
+use std::time::Duration;
 
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGrey;
@@ -47,6 +49,9 @@ const BAD: Color = Color::Red;
 /// including on panic, so a bug never leaves the user with a dead terminal.
 struct Screen {
     out: Stdout,
+    /// Set by [`Screen::suspend`]: the ordinary terminal has been used, so any
+    /// input queued since is stale and must not be replayed as hotkeys.
+    resumed: bool,
 }
 
 impl Screen {
@@ -64,7 +69,10 @@ impl Screen {
         enable_raw_mode().context("entering raw mode")?;
         let mut out = stdout();
         execute!(out, EnterAlternateScreen, cursor::Hide)?;
-        Ok(Self { out })
+        Ok(Self {
+            out,
+            resumed: false,
+        })
     }
 
     /// Drop back to the normal screen, run `body`, then come back.
@@ -75,7 +83,12 @@ impl Screen {
         press_any_key();
         enable_raw_mode()?;
         execute!(self.out, EnterAlternateScreen, cursor::Hide)?;
+        self.resumed = true;
         Ok(outcome)
+    }
+
+    fn take_resumed(&mut self) -> bool {
+        std::mem::take(&mut self.resumed)
     }
 }
 
@@ -105,6 +118,15 @@ struct Row {
 }
 
 impl Row {
+    /// Everything the studio offers, newest first. Empty until the row has
+    /// been checked - the catalogue arrives with the signed manifest.
+    fn releases(&self) -> Vec<Release> {
+        self.available
+            .as_ref()
+            .and_then(|a| a.manifest.releases().ok())
+            .unwrap_or_default()
+    }
+
     fn status(&self) -> (String, Color) {
         if let Some(error) = &self.error {
             return (truncate(error, 46), BAD);
@@ -130,6 +152,8 @@ enum View {
     List,
     Detail,
     Help,
+    /// Every version the studio offers, to look through and pick from.
+    Versions,
 }
 
 struct App {
@@ -138,6 +162,8 @@ struct App {
     view: View,
     status: String,
     client: Option<HttpClient>,
+    /// Which entry the version picker is on.
+    version_index: usize,
 }
 
 impl App {
@@ -157,6 +183,7 @@ impl App {
             view: View::List,
             status: "Press ? for keys, q to quit".into(),
             client: None,
+            version_index: 0,
         })
     }
 
@@ -235,10 +262,22 @@ impl App {
 pub fn run() -> Result<()> {
     let mut app = App::load()?;
     let mut screen = Screen::enter()?;
+    let mut reader = Reader::new();
 
     loop {
         app.draw(&mut screen)?;
-        let Some(key) = next_key()? else { continue };
+        let key = match reader.next()? {
+            None => continue,
+            // A file was dragged onto the window. Adding it is the only thing
+            // that could reasonably mean, whichever pane is showing.
+            Some(Input::Dropped(path)) => {
+                app.view = View::List;
+                act_add(&mut app, &mut screen, Some(path))?;
+                reader.drain();
+                continue;
+            }
+            Some(Input::Key(key)) => key,
+        };
 
         // Ctrl-C leaves, wherever we are.
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -258,12 +297,41 @@ pub fn run() -> Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
                     app.view = View::List
                 }
-                KeyCode::Char('u') => act_update(&mut app, &mut screen)?,
+                KeyCode::Char('u') => act_update(&mut app, &mut screen, None)?,
                 KeyCode::Char('c') => app.check_selected(&mut screen)?,
                 KeyCode::Char('l') => act_login(&mut app, &mut screen)?,
+                KeyCode::Char('v') => app.open_versions(),
                 KeyCode::Char('?') => app.view = View::Help,
                 _ => {}
             },
+            View::Versions => {
+                let count = app.current().map(|r| r.releases().len()).unwrap_or(0);
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
+                        app.view = View::Detail
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.version_index = app.version_index.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.version_index = (app.version_index + 1).min(count.saturating_sub(1))
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => app.version_index = 0,
+                    KeyCode::End | KeyCode::Char('G') => {
+                        app.version_index = count.saturating_sub(1)
+                    }
+                    KeyCode::Enter | KeyCode::Char('u') => {
+                        let chosen = app
+                            .current()
+                            .and_then(|r| r.releases().get(app.version_index).cloned());
+                        if let Some(release) = chosen {
+                            act_update(&mut app, &mut screen, Some(release.version))?;
+                        }
+                    }
+                    KeyCode::Char('?') => app.view = View::Help,
+                    _ => {}
+                }
+            }
             View::List => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
@@ -279,8 +347,9 @@ pub fn run() -> Result<()> {
                 }
                 KeyCode::Char('c') => app.check_selected(&mut screen)?,
                 KeyCode::Char('C') => app.check_all(&mut screen)?,
-                KeyCode::Char('u') => act_update(&mut app, &mut screen)?,
-                KeyCode::Char('a') => act_add(&mut app, &mut screen)?,
+                KeyCode::Char('u') => act_update(&mut app, &mut screen, None)?,
+                KeyCode::Char('v') => app.open_versions(),
+                KeyCode::Char('a') => act_add(&mut app, &mut screen, None)?,
                 KeyCode::Char('l') => act_login(&mut app, &mut screen)?,
                 KeyCode::Char('L') => act_logout(&mut app)?,
                 KeyCode::Char('r') => act_remove(&mut app, &mut screen)?,
@@ -293,20 +362,227 @@ pub fn run() -> Result<()> {
                 _ => {}
             },
         }
+
+        if screen.take_resumed() {
+            reader.drain();
+        }
     }
     Ok(())
 }
 
-/// Read one key press. Windows reports both press and release; acting on both
-/// would make every keystroke fire twice.
-fn next_key() -> Result<Option<KeyEvent>> {
-    match event::read().context("reading a key")? {
-        Event::Key(key) if key.kind == KeyEventKind::Press => Ok(Some(key)),
-        _ => Ok(None),
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+/// One key press, or a path that was dragged onto the window.
+enum Input {
+    Key(KeyEvent),
+    Dropped(String),
+}
+
+/// Terminal input, with a dropped file told apart from a keystroke.
+///
+/// A console has no separate "paste" event: dragging a file onto the window
+/// arrives as an ordinary burst of character key presses. Fed straight into
+/// the key map that is a disaster, and it was a real one - dropping
+/// `D:\Developing\CascadeProjects\...` scrolled the list, ran a check, and
+/// then hit the `a` of `Ca`, which opened the add prompt *half way through
+/// the path*. The prompt read the rest, `scadeProjects\...`, and reported a
+/// file that did not exist. The path was never mangled; it was eaten.
+///
+/// The tell is timing. A person cannot produce two key presses with no
+/// measurable gap between them, so characters already queued when the first
+/// is handled came from a paste. A burst that does not look like a path -
+/// holding `j` to scroll - is replayed key by key, so nothing is lost either
+/// way.
+struct Reader {
+    pending: VecDeque<KeyEvent>,
+}
+
+/// Windows reports both press and release; acting on both would make every
+/// keystroke fire twice.
+fn press(event: Event) -> Option<KeyEvent> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => Some(key),
+        _ => None,
     }
 }
 
+impl Reader {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<Input>> {
+        if let Some(key) = self.pending.pop_front() {
+            return Ok(Some(Input::Key(key)));
+        }
+
+        let Some(first) = press(event::read().context("reading a key")?) else {
+            return Ok(None);
+        };
+        let mut burst = vec![first];
+
+        // Only a printable character can begin a path, so only a printable
+        // character is worth waiting on. Arrows and Enter act immediately.
+        if starts_text(&first) {
+            // Wait a moment for a second character. Do not assume the rest of
+            // the paste is already queued - it is not, on every terminal, and
+            // an earlier version of this that only drained what was already
+            // waiting simply never fired. A person cannot follow one key with
+            // another inside this window; a paste always does.
+            if event::poll(FIRST_GAP)? {
+                if let Some(key) = press(event::read()?) {
+                    burst.push(key);
+                }
+            }
+            // From here it is a burst. Keep taking characters while they keep
+            // coming, but only for something that still looks like a path, so
+            // holding a key down never stalls the redraw.
+            while burst.len() > 1
+                && burst.len() < MAX_DROPPED_KEYS
+                && could_be_path(&burst)
+                && event::poll(BURST_GAP)?
+            {
+                if let Some(key) = press(event::read()?) {
+                    burst.push(key);
+                }
+            }
+        }
+
+        if let Some(path) = dropped_path(&burst) {
+            return Ok(Some(Input::Dropped(path)));
+        }
+        self.pending.extend(burst);
+        Ok(self.pending.pop_front().map(Input::Key))
+    }
+
+    /// Throw away input queued while the terminal was somewhere else.
+    fn drain(&mut self) {
+        self.pending.clear();
+        while matches!(event::poll(Duration::ZERO), Ok(true)) {
+            if event::read().is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// How long to wait after one printable key for a second one. Long enough
+/// that a paste always lands inside it, short enough to be invisible when it
+/// was really just a keystroke - which is the cost paid on every hotkey.
+const FIRST_GAP: Duration = Duration::from_millis(30);
+/// How long to keep collecting once a burst has been detected.
+const BURST_GAP: Duration = Duration::from_millis(40);
+/// Longer than any path a filesystem will hand out; stops a stuck terminal
+/// from collecting forever.
+const MAX_DROPPED_KEYS: usize = 8192;
+
+/// Could this key be the first character of a dropped path?
+fn starts_text(key: &KeyEvent) -> bool {
+    !key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(key.code, KeyCode::Char(_))
+}
+
+/// Should we keep waiting for more of this burst?
+///
+/// Key repeat produces a burst too, and stalling the redraw for one would make
+/// the list feel stuck. Three rules, in order of how quickly they settle it:
+///
+/// * anything that is not a plain character ends it outright;
+/// * a run of the *same* character is someone holding a key down, never a path;
+/// * otherwise collect a few characters before judging, because the separator
+///   that identifies a path is not always the first thing to arrive - a quoted
+///   `"C:\...` does not reach one until the third character.
+fn could_be_path(burst: &[KeyEvent]) -> bool {
+    let plain = burst.iter().all(|key| {
+        !key.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter)
+    });
+    if !plain {
+        return false;
+    }
+    let chars: Vec<char> = burst
+        .iter()
+        .filter_map(|key| match key.code {
+            KeyCode::Char(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    if chars.len() > 1 && chars.iter().all(|c| *c == chars[0]) {
+        return false;
+    }
+    chars.len() < SEPARATOR_WINDOW || chars.iter().any(|c| matches!(c, '/' | '\\' | ':' | '~'))
+}
+
+/// How many characters to collect before insisting a burst looks path-shaped.
+const SEPARATOR_WINDOW: usize = 8;
+
+/// Is this burst a pasted path rather than someone leaning on a key?
+fn dropped_path(burst: &[KeyEvent]) -> Option<String> {
+    if burst.len() < 4 {
+        return None;
+    }
+    let mut text = String::new();
+    for key in burst {
+        // Ctrl- and Alt-chords are commands, never part of a pasted path.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return None;
+        }
+        match key.code {
+            KeyCode::Char(c) => text.push(c),
+            // Some terminals append a newline to a drop; anything else in the
+            // middle of the burst means this was not one.
+            KeyCode::Enter => {}
+            _ => return None,
+        }
+    }
+    let text = text.trim();
+    looks_like_path(text).then(|| text.to_string())
+}
+
+/// A deliberately loose test - it only decides whether to *offer* to add the
+/// file, and `hermes add` still parses and validates whatever comes through.
+fn looks_like_path(text: &str) -> bool {
+    let text = text.trim_matches(['"', '\'']);
+    if text.chars().count() < 4 {
+        return false;
+    }
+    text.starts_with("file://")
+        || text.contains('/')
+        || text.contains('\\')
+        // A bare `C:something` - a drive-relative path.
+        || text.chars().nth(1) == Some(':')
+}
+
 impl App {
+    /// Open the version picker, which needs a checked row to have anything in
+    /// it: the catalogue arrives with the signed manifest, not from disk.
+    fn open_versions(&mut self) {
+        match self.current() {
+            None => self.status = "nothing selected".into(),
+            Some(row) if row.available.is_none() => {
+                self.status = "press c to check first - the versions come with the manifest".into()
+            }
+            Some(row) if row.releases().len() <= 1 => {
+                self.status = "this studio offers one version".into();
+                self.version_index = 0;
+                self.view = View::Versions;
+            }
+            Some(_) => {
+                self.version_index = 0;
+                self.view = View::Versions;
+            }
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
@@ -321,53 +597,95 @@ impl App {
 // Actions - all of these suspend the TUI and reuse the normal code paths
 // ---------------------------------------------------------------------------
 
-fn act_update(app: &mut App, screen: &mut Screen) -> Result<()> {
+/// `version` is `Some` when the user picked one out of the version list;
+/// `None` takes whatever is newest.
+fn act_update(
+    app: &mut App,
+    screen: &mut Screen,
+    version: Option<semver::Version>,
+) -> Result<()> {
     let Some(row) = app.current() else {
         app.status = "nothing selected".into();
         return Ok(());
     };
     let origin = row.origin.clone();
     let known = row.available.is_some();
+    let name = origin.name.clone();
 
-    let outcome = screen.suspend(|| -> Result<()> {
+    let chosen = version.clone();
+    let outcome = screen.suspend(move || -> Result<()> {
         let client = HttpClient::new()?;
         if !known {
             println!("\n  Checking {}...", origin.name);
         }
         let available = update::check(&client, &origin)?;
-        if !available.is_newer {
+        if chosen.is_none() && !available.is_newer {
             println!(
                 "\n  {} is already up to date ({}).",
                 origin.name, available.manifest.latest_version
             );
             return Ok(());
         }
-        // The consent prompt inside `apply` is the real one, on the real
-        // terminal: the interactive mode never approves anything on its own.
-        update::apply(&client, &origin, &available, &UpdateOptions::default())
+        // Every prompt inside `apply` - the folder scope, and the downgrade
+        // warning when an older version was picked - is the real one on the
+        // real terminal. The interactive mode never approves anything itself.
+        let options = UpdateOptions {
+            version: chosen,
+            ..UpdateOptions::default()
+        };
+        update::apply(&client, &origin, &available, &options)
     })?;
 
     match outcome {
-        Ok(()) => app.status = format!("{} finished", origin.name),
-        Err(e) => app.status = format!("{}: {e:#}", origin.name),
+        Ok(()) => {
+            app.status = match &version {
+                Some(v) => format!("{name} is now on {v}"),
+                None => format!("{name} finished"),
+            };
+            app.view = View::List;
+        }
+        Err(e) => app.status = format!("{name}: {e:#}"),
     }
     app.reload()?;
     Ok(())
 }
 
-fn act_add(app: &mut App, screen: &mut Screen) -> Result<()> {
-    let outcome = screen.suspend(|| -> Result<String> {
-        println!("\n  Drag a .origin file into this window and press Enter.");
-        print!("  > ");
-        let _ = stdout().flush();
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line)?;
-        let line = line.trim().to_string();
+/// `dropped` is `Some` when the path arrived by drag-and-drop onto the list,
+/// in which case there is nothing left to ask for.
+fn act_add(app: &mut App, screen: &mut Screen, dropped: Option<String>) -> Result<()> {
+    let outcome = screen.suspend(move || -> Result<String> {
+        let line = match dropped {
+            Some(path) => {
+                println!("\n  Dropped: {path}");
+                path
+            }
+            None => {
+                println!("\n  Drag a .origin file into this window and press Enter.");
+                print!("  > ");
+                let _ = stdout().flush();
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim().to_string()
+            }
+        };
         if line.is_empty() {
             return Ok("cancelled".into());
         }
         let path = registry::normalize_dropped_path(&line);
-        let origin = registry::read_origin_file(&path)?;
+        println!("  Reading: {}", display_path(&path));
+
+        // Report the failure here, on the ordinary terminal, rather than
+        // handing it to the status bar - that is one truncated line, and the
+        // useful part of a parse error (which file, which line, what is wrong
+        // with it) is exactly what gets cut off.
+        let origin = match registry::read_origin_file(&path) {
+            Ok(origin) => origin,
+            Err(e) => {
+                println!("\n  Could not add it.\n");
+                println!("  {e:#}");
+                return Ok("could not read that file - see above".into());
+            }
+        };
         let existed = registry::add_origin(&origin, false)?;
         println!(
             "\n  {} {} ({})",
@@ -477,6 +795,7 @@ impl App {
             View::List => self.draw_list(out, width, height)?,
             View::Detail => self.draw_detail(out, width, height)?,
             View::Help => self.draw_help(out, width)?,
+            View::Versions => self.draw_versions(out, width, height)?,
         }
 
         self.draw_footer(out, width, height)?;
@@ -514,11 +833,11 @@ impl App {
                 Print("  Nothing registered yet."),
                 cursor::MoveTo(0, 5),
                 SetForegroundColor(MUTED),
-                Print("  Press  a  to add a .origin file (drag and drop works)."),
+                Print("  Drag a .origin file onto this window, or press  a  to type"),
                 cursor::MoveTo(0, 6),
-                Print("  A studio gives you that file; it is the trust root for"),
+                Print("  its path. A studio gives you that file; it is the trust root"),
                 cursor::MoveTo(0, 7),
-                Print("  everything HERMES will install for them."),
+                Print("  for everything HERMES will install for them."),
                 ResetColor
             )?;
             return Ok(());
@@ -596,6 +915,9 @@ impl App {
         line(out, &mut y, format!("  id         {}", row.origin.id))?;
         if let Some(publisher) = &row.origin.publisher {
             line(out, &mut y, format!("  publisher  {publisher}"))?;
+        }
+        if let Some(homepage) = &row.origin.homepage {
+            line(out, &mut y, format!("  home       {homepage}"))?;
         }
         line(
             out,
@@ -675,13 +997,112 @@ impl App {
         Ok(())
     }
 
+    /// The version picker: what the studio offers, and what is installed.
+    fn draw_versions<W: Write>(&self, out: &mut W, width: usize, height: usize) -> Result<()> {
+        let Some(row) = self.current() else {
+            return Ok(());
+        };
+        let releases = row.releases();
+        let installed = row.state.installed_version();
+
+        queue!(
+            out,
+            cursor::MoveTo(0, 3),
+            SetAttribute(Attribute::Bold),
+            Print(format!(
+                "  {} - choose a version",
+                truncate(&row.origin.name, width.saturating_sub(24))
+            )),
+            SetAttribute(Attribute::Reset)
+        )?;
+
+        // Two lines per entry (version, then its first note), so the visible
+        // count has to be halved or the notes scroll off under the footer.
+        let visible = height.saturating_sub(8) / 2;
+        let first = self.version_index.saturating_sub(visible.saturating_sub(1));
+        let mut y = 5u16;
+
+        for (offset, release) in releases.iter().skip(first).take(visible).enumerate() {
+            let index = first + offset;
+            let selected = index == self.version_index;
+            let is_installed = installed.as_ref() == Some(&release.version);
+
+            let mut tags = Vec::new();
+            if release.is_latest {
+                tags.push("latest");
+            }
+            if is_installed {
+                tags.push("installed");
+            }
+            let size = release
+                .artifact()
+                .map(|a| crate::net::human_bytes(a.size_bytes))
+                .unwrap_or_else(|_| "no build for this platform".into());
+
+            queue!(out, cursor::MoveTo(0, y))?;
+            if selected {
+                queue!(out, SetAttribute(Attribute::Reverse))?;
+            }
+            queue!(
+                out,
+                Print(format!(
+                    "  {} {:<14} {:<26}",
+                    if selected { ">" } else { " " },
+                    release.version.to_string(),
+                    size
+                ))
+            )?;
+            queue!(out, SetAttribute(Attribute::Reset))?;
+            if !tags.is_empty() {
+                queue!(
+                    out,
+                    SetForegroundColor(if is_installed { GOOD } else { ACCENT }),
+                    Print(format!("[{}]", tags.join(", "))),
+                    ResetColor
+                )?;
+            }
+            y += 1;
+
+            if let Some(notes) = release.display_notes() {
+                if let Some(line) = notes.iter().find(|l| !l.trim().is_empty()) {
+                    queue!(
+                        out,
+                        cursor::MoveTo(0, y),
+                        SetForegroundColor(MUTED),
+                        Print(format!("      {}", truncate(line, width.saturating_sub(8)))),
+                        ResetColor
+                    )?;
+                }
+            }
+            y += 1;
+        }
+
+        if releases.len() > visible {
+            queue!(
+                out,
+                cursor::MoveTo(0, y),
+                SetForegroundColor(MUTED),
+                Print(format!(
+                    "  showing {}-{} of {}",
+                    first + 1,
+                    (first + visible).min(releases.len()),
+                    releases.len()
+                )),
+                ResetColor
+            )?;
+        }
+        Ok(())
+    }
+
     fn draw_help<W: Write>(&self, out: &mut W, width: usize) -> Result<()> {
         let keys = [
             ("up / down, k / j", "move between applications"),
             ("enter", "open details and release notes"),
             ("c / C", "check the selected one / check all"),
-            ("u", "update the selected application"),
-            ("a", "add a .origin file (drag and drop it in)"),
+            ("u", "update to the newest version"),
+            ("v", "list every version and pick one"),
+            ("a", "add a .origin file by typing its path"),
+            ("drag a file in", "add it - no key needed"),
             ("l / L", "sign in to / out of a studio"),
             ("r", "stop tracking an application"),
             ("? , h", "this help"),
@@ -725,9 +1146,10 @@ impl App {
     fn draw_footer<W: Write>(&self, out: &mut W, width: usize, height: usize) -> Result<()> {
         let y = height.saturating_sub(2) as u16;
         let hints = match self.view {
-            View::List => "up/down move   enter details   c check   u update   a add   ? help   q quit",
-            View::Detail => "u update   c check   l login   esc back   q back",
+            View::List => "up/down move   enter details   c check   u update   v versions   a add   q quit",
+            View::Detail => "u update   v versions   c check   l login   esc back",
             View::Help => "esc back",
+            View::Versions => "up/down choose   enter install this version   esc back",
         };
         queue!(
             out,
@@ -782,7 +1204,6 @@ mod tests {
             public_key: "UepisXeS+U1Eehy5elRw+1d9QM00EGqg1XKp6kueHF8=".into(),
             publisher: Some("Example Studio".into()),
             homepage: None,
-            install_dir: None,
             requires_auth: false,
         }
     }
@@ -802,6 +1223,7 @@ mod tests {
             minimum_client_version: None,
             foiled_path: None,
             platforms: None,
+            versions: None,
             requires_auth: false,
         }
     }
@@ -813,6 +1235,7 @@ mod tests {
             view,
             status: "ready".into(),
             client: None,
+            version_index: 0,
         }
     }
 
@@ -889,7 +1312,7 @@ mod tests {
                 ),
             ]
         };
-        for view in [View::List, View::Detail, View::Help] {
+        for view in [View::List, View::Detail, View::Help, View::Versions] {
             for (width, height) in [(1, 1), (10, 3), (40, 10), (80, 24), (200, 60)] {
                 let app = app(rows(), view_of(&view));
                 let _ = render(&app, width, height);
@@ -906,6 +1329,7 @@ mod tests {
             View::List => View::List,
             View::Detail => View::Detail,
             View::Help => View::Help,
+            View::Versions => View::Versions,
         }
     }
 
@@ -956,5 +1380,122 @@ mod tests {
 
     fn app_empty() -> App {
         app(Vec::new(), View::List)
+    }
+
+    // -- drag and drop -------------------------------------------------------
+
+    fn typed(text: &str) -> Vec<KeyEvent> {
+        text.chars()
+            .map(|c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .collect()
+    }
+
+    /// The bug this exists to prevent: every character of a dropped path used
+    /// to be handled as a hotkey, and the `a` in `...\Ca` opened the add
+    /// prompt part way through, so only the tail was ever read.
+    #[test]
+    fn a_dropped_windows_path_is_recognised_whole() {
+        let path = r"D:\Developing\CascadeProjects\Scripts\thething\test.origin";
+        assert_eq!(dropped_path(&typed(path)).as_deref(), Some(path));
+
+        // The tail that used to arrive at the prompt on its own is exactly
+        // what must never be produced again.
+        assert!(!dropped_path(&typed(path))
+            .expect("recognised")
+            .starts_with("scade"));
+    }
+
+    #[test]
+    fn quoted_and_uri_drops_are_recognised() {
+        for raw in [
+            "\"C:\\Program Files\\Starfall\\starfall.origin\"",
+            "'/home/u/My Game/game.origin'",
+            "file:///home/u/My%20Game/game.origin",
+            "/opt/games/starfall.origin",
+            "./starfall.origin",
+        ] {
+            assert!(dropped_path(&typed(raw)).is_some(), "{raw}");
+        }
+        // A terminal that appends a newline to the drop.
+        let mut with_enter = typed("/opt/games/starfall.origin");
+        with_enter.push(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(dropped_path(&with_enter).is_some());
+    }
+
+    /// Key repeat produces a burst too. It must still reach the key map, or
+    /// holding `j` would stop scrolling the list.
+    #[test]
+    fn a_run_of_repeated_keys_is_not_a_path() {
+        assert!(dropped_path(&typed("jjjjjjjj")).is_none());
+        assert!(dropped_path(&typed("kkkk")).is_none());
+        // Short bursts are never paths.
+        assert!(dropped_path(&typed("cu")).is_none());
+        // Nor is anything with a chord or a navigation key in it.
+        let mut mixed = typed("/opt/games/x");
+        mixed.push(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(dropped_path(&mixed).is_none());
+        let ctrl = vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)]
+            .into_iter()
+            .chain(typed("/opt/x"))
+            .collect::<Vec<_>>();
+        assert!(dropped_path(&ctrl).is_none());
+    }
+
+    /// Waiting for the rest of a burst is only worth it for something that
+    /// might be a path; holding `j` must never stall the redraw.
+    #[test]
+    fn only_a_path_shaped_burst_is_worth_waiting_for() {
+        assert!(could_be_path(&typed(r"D:\Dev")));
+        assert!(could_be_path(&typed("/opt")));
+        assert!(could_be_path(&typed("~/g")));
+        assert!(!could_be_path(&typed("jjjjjjjj")));
+        assert!(!could_be_path(&typed("CCCC")));
+    }
+
+    /// A quoted path reaches no separator until its third character, so the
+    /// decision has to wait a few characters rather than judging on the first.
+    #[test]
+    fn a_quoted_path_survives_its_opening_characters() {
+        assert!(could_be_path(&typed("\"")));
+        assert!(could_be_path(&typed("\"C")));
+        assert!(could_be_path(&typed("\"C:")));
+        assert!(could_be_path(&typed("\"C:\\Program Files\\x")));
+    }
+
+    /// Key repeat is the one burst that must be given up on immediately.
+    #[test]
+    fn a_held_key_is_abandoned_before_it_stalls_anything() {
+        assert!(!could_be_path(&typed("jj")));
+        assert!(!could_be_path(&typed("CC")));
+        // ...but two *different* characters are still undecided.
+        assert!(could_be_path(&typed("ab")));
+    }
+
+    /// Only a printable character can begin a path; navigation keys must act
+    /// at once rather than paying the wait.
+    #[test]
+    fn only_printable_keys_begin_a_possible_drop() {
+        assert!(starts_text(&KeyEvent::new(
+            KeyCode::Char('D'),
+            KeyModifiers::NONE
+        )));
+        assert!(!starts_text(&KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE
+        )));
+        assert!(!starts_text(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn a_recognised_drop_is_a_path_the_registry_can_parse() {
+        let raw = "\"D:\\Games\\My Game\\game.origin\"";
+        let dropped = dropped_path(&typed(raw)).expect("recognised");
+        assert_eq!(
+            registry::normalize_dropped_path(&dropped),
+            std::path::PathBuf::from("D:\\Games\\My Game\\game.origin")
+        );
     }
 }
