@@ -281,8 +281,39 @@ pub struct Manifest {
     /// Path of the plan inside the archive; defaults to `update.foiled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foiled_path: Option<String>,
+    /// Per-platform artifacts, keyed by [`platform_key`] (`windows-x86_64`,
+    /// `linux-x86_64`, `macos-aarch64`, ...).
+    ///
+    /// Software that ships a different binary per platform - a CLI updating
+    /// itself, for one - cannot describe itself with a single `download_url`.
+    /// When this map is present and contains the running platform, its entry
+    /// wins; the top-level fields stay as the fallback for anything portable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platforms: Option<std::collections::BTreeMap<String, PlatformArtifact>>,
     #[serde(default)]
     pub requires_auth: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformArtifact {
+    pub download_url: String,
+    pub checksum_sha256: String,
+    pub size_bytes: u64,
+}
+
+/// How the running platform names itself in a manifest's `platforms` map.
+pub fn platform_key() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The download a client should actually fetch.
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    pub download_url: String,
+    pub checksum_sha256: String,
+    pub size_bytes: u64,
+    /// `None` when the top-level fallback was used.
+    pub platform: Option<String>,
 }
 
 impl Manifest {
@@ -293,6 +324,35 @@ impl Manifest {
 
     pub fn foiled_entry(&self) -> &str {
         self.foiled_path.as_deref().unwrap_or(FOILED_ENTRY_NAME)
+    }
+
+    /// Pick the artifact for the platform we are running on.
+    ///
+    /// A manifest that lists platforms but not *this* one is a hard error
+    /// rather than a silent fallback: quietly installing another platform's
+    /// binary is worse than saying there is no build.
+    pub fn artifact(&self) -> Result<Artifact> {
+        let Some(platforms) = &self.platforms else {
+            return Ok(Artifact {
+                download_url: self.download_url.clone(),
+                checksum_sha256: self.checksum_sha256.clone(),
+                size_bytes: self.size_bytes,
+                platform: None,
+            });
+        };
+        let key = platform_key();
+        let entry = platforms.get(&key).ok_or_else(|| {
+            anyhow!(
+                "this release has no build for {key} (it offers: {})",
+                platforms.keys().cloned().collect::<Vec<_>>().join(", ")
+            )
+        })?;
+        Ok(Artifact {
+            download_url: entry.download_url.clone(),
+            checksum_sha256: entry.checksum_sha256.clone(),
+            size_bytes: entry.size_bytes,
+            platform: Some(key),
+        })
     }
 
     /// Structural checks. Signature and freshness live in `security::crypto`.
@@ -329,6 +389,28 @@ impl Manifest {
                     "release_notes is {} bytes; the cap is {MAX_RELEASE_NOTES_BYTES}",
                     notes.len()
                 );
+            }
+        }
+        if let Some(platforms) = &self.platforms {
+            if platforms.is_empty() {
+                bail!("platforms is present but empty");
+            }
+            if platforms.len() > 32 {
+                bail!("platforms lists {} entries; the cap is 32", platforms.len());
+            }
+            for (key, artifact) in platforms {
+                if key.is_empty() || key.len() > 64 {
+                    bail!("platform key '{key}' must be 1-64 characters");
+                }
+                require_secure_url(&artifact.download_url, "platform download_url")?;
+                if artifact.checksum_sha256.len() != 64
+                    || !artifact.checksum_sha256.chars().all(|c| c.is_ascii_hexdigit())
+                {
+                    bail!("platform '{key}' checksum_sha256 must be 64 hex characters");
+                }
+                if artifact.size_bytes == 0 || artifact.size_bytes > MAX_RELEASE_BYTES {
+                    bail!("platform '{key}' size_bytes is out of range");
+                }
             }
         }
         Ok(())

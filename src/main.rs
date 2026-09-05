@@ -23,6 +23,7 @@ mod paths;
 mod registry;
 mod schema;
 mod security;
+mod selfupdate;
 mod system_icons;
 mod tui;
 mod update;
@@ -100,6 +101,15 @@ enum Command {
     },
     /// Remove the installed binary, its PATH entry and its file associations
     Uninstall,
+    /// Update HERMES itself from the origin it publishes for itself
+    SelfUpdate {
+        /// Report what is available without installing it
+        #[arg(long)]
+        check: bool,
+        /// Do not ask before replacing the binary
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Register .origin/.foiled icons and double-click handling with the OS
     InstallSystem,
     /// Undo `install-system`
@@ -192,6 +202,10 @@ enum StudioCommand {
 }
 
 fn main() {
+    // A previous `self-update` leaves the outgoing binary behind, because a
+    // running image cannot be unlinked. Clear it on the next start.
+    selfupdate::clean_previous();
+
     let cli = Cli::parse();
     let keep_open = matches!(
         &cli.command,
@@ -263,6 +277,9 @@ fn run(cli: Cli) -> Result<()> {
             no_associations,
         } => cmd_install(dir, no_associations),
         Command::Uninstall => cmd_uninstall(),
+        Command::SelfUpdate { check, yes } => {
+            selfupdate::run(&net::HttpClient::new()?, yes, check)
+        }
         Command::InstallSystem => cmd_install_system(),
         Command::UninstallSystem => cmd_uninstall_system(),
         Command::Studio(cmd) => studio::run(cmd),

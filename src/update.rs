@@ -214,23 +214,29 @@ pub fn apply(
     let staging = Staging::create(&install_dir, &origin.id)?;
 
     // ---- 1. stream the archive to disk, hashing on the fly ---------------
+    let artifact = manifest.artifact()?;
     println!(
-        "  downloading {} {} ({})",
+        "  downloading {} {} ({}{})",
         origin.name,
         offered,
-        human_bytes(manifest.size_bytes)
+        human_bytes(artifact.size_bytes),
+        artifact
+            .platform
+            .as_ref()
+            .map(|p| format!(", {p}"))
+            .unwrap_or_default()
     );
     let token = auth::bearer_for(origin)?;
     let digest = client.stream_download(
-        &manifest.download_url,
+        &artifact.download_url,
         token.as_deref(),
         &staging.archive,
-        manifest.size_bytes,
+        artifact.size_bytes,
         "download",
     )?;
 
     // ---- 2. the archive is untrusted until this line ----------------------
-    crypto::verify_checksum(&manifest.checksum_sha256, &digest)?;
+    crypto::verify_checksum(&artifact.checksum_sha256, &digest)?;
     println!("  checksum ok  sha256:{}", &digest[..16]);
 
     // ---- 3. unpack inside the Zip-Slip sandbox ---------------------------

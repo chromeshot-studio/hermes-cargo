@@ -1,5 +1,10 @@
 /target
+/dist
 .staging/
+
+# Signing keys never belong in the repository. release.py keeps them in your
+# home directory; this is the second line of defence.
+*.key
 
 # Cargo.lock is committed: this is a binary, and pinning the exact
 # dependency graph is part of the supply-chain story.

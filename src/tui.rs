@@ -629,7 +629,11 @@ impl App {
                 &mut y,
                 format!(
                     "  size       {}",
-                    crate::net::human_bytes(available.manifest.size_bytes)
+                    available
+                        .manifest
+                        .artifact()
+                        .map(|a| crate::net::human_bytes(a.size_bytes))
+                        .unwrap_or_else(|_| "no build for this platform".into())
                 ),
             )?;
 
@@ -797,6 +801,7 @@ mod tests {
             release_notes_url: None,
             minimum_client_version: None,
             foiled_path: None,
+            platforms: None,
             requires_auth: false,
         }
     }

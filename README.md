@@ -94,12 +94,12 @@ hermes uninstall-system    # reverses all of it
 Cross-compiling is ordinary `cargo`: `rustup target add <triple>` then
 `cargo build --release --target <triple>`. Note that `install-system` compiles
 the icon set for the *target* OS only (`.ico` on Windows, `.icns` on macOS,
-PNG/SVG on Linux), so each platform's binary carries only what it needs.
+PNGs on Linux), so each platform's binary carries only what it needs.
 
 ### Regenerating the icons
 
-Icons are embedded in the binary with `include_bytes!`. They are generated, not
-hand-drawn:
+Icons are embedded in the binary with `include_bytes!`, and derived from the
+source artwork in `assets/` - edit those three PNGs, then:
 
 ```sh
 python tools/gen_icons.py     # needs Pillow
@@ -183,6 +183,52 @@ Before anything is written, you get the permission prompt:
 
 Answer anything but `y` and nothing happens. On a non-interactive terminal the
 answer is always no.
+
+## Updating HERMES itself
+
+HERMES ships as a studio of its own. This repository is the studio, GitHub
+Releases is the CDN, and `hermes.origin` is an ordinary origin file — the same
+format any other publisher would hand you.
+
+```sh
+hermes add hermes.origin     # once; it comes with every release
+hermes self-update --check   # what is available, and why
+hermes self-update           # verify, ask, replace the binary
+```
+
+**Nothing is compiled in.** There is still no key baked into the binary: a
+fresh build trusts nobody until you add an `.origin` by hand, HERMES's own
+included. `self-update` refuses to run until you have. The tool holds itself to
+the promise it makes about everyone else.
+
+It cannot use the ordinary update pipeline, though, and the reason is worth
+knowing. A normal update finishes by renaming a directory into place, and
+Windows will not rename a directory that contains a running `.exe`. So
+`self-update` reuses the pipeline exactly as far as the bytes are verified —
+manifest signature, streamed SHA-256, checksum, Zip-Slip-sandboxed extraction —
+and then differs only in the final move: it renames the *running binary* aside
+(which is permitted) and puts the new one in its place. The old binary stays as
+`hermes.exe.old` until the next launch, because a running image cannot be
+unlinked.
+
+If the copy fails, the old binary is renamed back. You are never left without a
+working HERMES.
+
+### Cutting a release (maintainers)
+
+```sh
+python tools/release.py --version 0.2.0 --notes dist/NOTES.md
+```
+
+That builds, packages, checksums, signs, and writes `dist/manifest.json` plus
+the `hermes.origin` users add. Run it once per platform you ship — the
+`platforms` map accumulates, so building on Windows and then on Linux yields a
+single manifest covering both. It prints the `gh release create` line to
+finish with.
+
+The signing key lives in `~/.hermes-keys/`, never in the repository, and
+`.gitignore` refuses `*.key` as a second line of defence. Anyone holding it can
+sign an update that every HERMES user installs.
 
 ## Quick start — studios
 
@@ -285,7 +331,15 @@ requires_auth = true
 ```
 
 Optional payload fields: `expires_at`, `release_notes`, `release_notes_url`,
-`minimum_client_version`, `foiled_path`.
+`minimum_client_version`, `foiled_path`, `platforms`.
+
+`platforms` maps `os-arch` keys (`windows-x86_64`, `linux-x86_64`,
+`macos-aarch64`) to a `download_url` / `checksum_sha256` / `size_bytes` of their
+own, for software that ships a different binary per platform. When it is
+present, the entry for the running platform wins and the top-level fields are
+the fallback. A manifest that lists platforms but not yours is an error rather
+than a silent fallback - quietly installing another platform's binary is worse
+than saying there is no build.
 
 `release_notes` is plain text carried **inside the signed payload**, so what a
 user reads before granting folder access is exactly what you signed. It is
@@ -342,6 +396,7 @@ approved, so an update cannot escalate into arbitrary code execution.
 | *(no arguments)* | Open the interactive list |
 | `ui` | The same, explicitly |
 | `install` | Copy the binary somewhere permanent, add it to `PATH`, register file types |
+| `self-update [--check]` | Update HERMES itself from the origin it publishes |
 | `uninstall` | Reverse all of that |
 | `add [paths...]` | Register `.origin` files; prompts for a drop if given none |
 | `list` | Everything HERMES tracks, with installed versions |
@@ -388,7 +443,7 @@ installed application exactly as it was.
 ## Testing
 
 ```sh
-cargo test                    # 38 unit tests, no network
+cargo test                    # 43 unit tests, no network
 cargo build && python tools/e2e_test.py    # 44 checks against a local studio
 ```
 

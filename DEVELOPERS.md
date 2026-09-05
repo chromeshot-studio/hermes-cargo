@@ -14,6 +14,7 @@ being silently broken, and none of them fail loudly on their own.
 | `src/main.rs` | CLI surface (clap), command handlers, `studio` subcommands |
 | `src/tui.rs` | The interactive list shown when `hermes` is run with no arguments |
 | `src/install.rs` | `hermes install` - permanent location and `PATH` management |
+| `src/selfupdate.rs` | `hermes self-update` - replacing the running binary |
 | `src/schema.rs` | The three document formats and their validation |
 | `src/registry.rs` | The `.origin` registry, key pinning, drag-and-drop path parsing |
 | `src/security/crypto.rs` | Ed25519 verification, streaming SHA-256, rollback refusal |
@@ -28,6 +29,8 @@ being silently broken, and none of them fail loudly on their own.
 | `src/error.rs` | `SecurityError` — the type that means "stop" |
 | `tools/gen_icons.py` | Generates `assets/icons/` from primitives |
 | `tools/e2e_test.py` | Full round trip against a local studio, plus attacks |
+| `tools/release.py` | Build, package, sign and lay out a release in `dist/` |
+| `tools/demo_studio.py` | A local studio to drive the CLI against by hand |
 
 ## The pipeline
 
@@ -107,7 +110,14 @@ the target first and then creates exclusively (`create_new(true)`).
 Symlinks, devices, FIFOs and duplicate entries are refused outright, and
 setuid/setgid/sticky bits from archive metadata are dropped on the floor.
 
-**11. The interactive mode never approves anything.**
+**11. `self-update` may skip the directory swap, never the verification.**
+`src/selfupdate.rs` exists only because Windows will not rename a directory
+containing a running `.exe`. It reuses `update::check`, `stream_download`,
+`verify_checksum` and `extract_zip_secure` unchanged, and differs *only* in the
+final move. If you touch it, the rule is that every byte is still verified
+before anything is written, and the old binary is restored if the swap fails.
+
+**12. The interactive mode never approves anything.**
 `src/tui.rs` has no consent logic of its own. Every action that needs a
 decision calls `Screen::suspend`, drops back to the ordinary terminal, and runs
 the same command-line code path with the same prompt. If you ever find yourself
@@ -153,7 +163,7 @@ Implement `install(exe, icons, report)` and `uninstall(report)`. Rules:
 ## Testing
 
 ```sh
-cargo test                                  # 38 unit tests, no network
+cargo test                                  # 43 unit tests, no network
 cargo build && python tools/e2e_test.py     # 44 checks, ~10s
 ```
 
