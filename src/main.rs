@@ -166,6 +166,8 @@ enum TemplateKind {
     Origin,
     /// The plan that ships inside a release archive: what to install, and how
     Foiled,
+    /// The manifest body you fill in and hand to `studio sign`
+    Manifest,
 }
 
 #[derive(Args, Clone, Copy)]
@@ -220,7 +222,7 @@ enum StudioCommand {
         #[arg(long, default_value = "-")]
         out: PathBuf,
     },
-    /// Write a commented starter .origin or .foiled to copy and edit
+    /// Write a starter .origin, .foiled or manifest body to copy and edit
     Template {
         /// Which document to write
         #[arg(value_enum)]
@@ -966,6 +968,7 @@ mod studio {
                 let (document, suggested) = match kind {
                     TemplateKind::Origin => (schema::ORIGIN_TEMPLATE, "starfall.origin"),
                     TemplateKind::Foiled => (schema::FOILED_TEMPLATE, "update.foiled"),
+                    TemplateKind::Manifest => (schema::PAYLOAD_TEMPLATE, "payload.json"),
                 };
                 if out == Path::new("-") {
                     print!("{document}");
@@ -979,14 +982,32 @@ mod studio {
                 std::fs::write(&out, document)
                     .with_context(|| format!("writing {}", out.display()))?;
                 println!("\n  Wrote {}", display_path(&out));
-                println!("  Read the comments in it, then edit it.");
                 match kind {
-                    TemplateKind::Origin => println!(
-                        "  Replace the placeholder key: hermes studio keygen --id <your.id>\n"
-                    ),
-                    TemplateKind::Foiled => println!(
-                        "  It belongs at the root of your release archive as {suggested}.\n"
-                    ),
+                    TemplateKind::Origin => {
+                        println!("  Read the comments in it, then edit it.");
+                        println!(
+                            "  Replace the placeholder key: hermes studio keygen --id <your.id>\n"
+                        );
+                    }
+                    TemplateKind::Foiled => {
+                        println!("  Read the comments in it, then edit it.");
+                        println!(
+                            "  It belongs at the root of your release archive as {suggested}.\n"
+                        );
+                    }
+                    TemplateKind::Manifest => {
+                        // JSON carries no comments, so everything a copied
+                        // payload will be wrong about has to be said here.
+                        println!("  This is the manifest *body*. Every checksum, size and URL in");
+                        println!("  it is a placeholder, and issued_at must be the moment you");
+                        println!("  publish. Get the real numbers with:");
+                        println!("      hermes studio checksum <your-release.zip>");
+                        println!("  Delete `platforms` unless you ship a different build per");
+                        println!("  platform, and `versions` unless you offer older releases.");
+                        println!("  Then sign it into the document you upload:");
+                        println!("      hermes studio sign --key <your.key> \\");
+                        println!("          --payload {suggested} --out manifest.json\n");
+                    }
                 }
                 Ok(())
             }
@@ -1006,11 +1027,28 @@ mod studio {
                 let origin_file = registry::read_origin_file(&origin)?;
                 let raw = std::fs::read(&manifest)
                     .with_context(|| format!("reading {}", manifest.display()))?;
-                let verified = security::crypto::verify_manifest(
-                    &origin_file,
-                    &raw,
-                    paths::now_unix(),
-                )?;
+                let verified =
+                    match security::crypto::verify_manifest(&origin_file, &raw, paths::now_unix()) {
+                        Ok(verified) => verified,
+                        Err(e) => {
+                            // Studio-side self-check on your own artifact, so a
+                            // diagnosis is safe here in a way it would not be on
+                            // the user-facing path: the refusal still stands, and
+                            // the commonest cause by far is an editor or git
+                            // rewriting line endings after signing.
+                            if raw.contains(&b'\r') {
+                                eprintln!(
+                                    "\n  note: this file has CRLF line endings. The signature \
+                                     covers the payload's\n  raw bytes, so anything that \
+                                     rewrites them - an editor, or git's end-of-line\n  \
+                                     conversion - invalidates it. Re-run `hermes studio sign` \
+                                     rather than\n  editing manifest.json, and mark it `-text` \
+                                     in .gitattributes."
+                                );
+                            }
+                            return Err(e);
+                        }
+                    };
                 println!("\n  Signature OK.");
                 println!("    origin  : {}", verified.origin_id);
                 println!("    version : {}", verified.latest_version);

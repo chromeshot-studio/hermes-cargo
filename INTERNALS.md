@@ -34,6 +34,7 @@ being silently broken, and none of them fail loudly on their own.
 | `DEVELOPERS.md` | The publishing guide - studio-facing, not about this code |
 | `tools/gen_icons.py` | Generates `assets/icons/` from primitives |
 | `tools/e2e_test.py` | Full round trip against a local studio, plus attacks |
+| `tools/studio.py` | The guided path for *any* studio: `init` and `release` |
 | `tools/release.py` | Build, package, sign and lay out a release in `dist/` |
 | `tools/demo_studio.py` | A local studio to drive the CLI against by hand |
 
@@ -213,8 +214,8 @@ Implement `install(exe, icons, report)` and `uninstall(report)`. Rules:
 ## Testing
 
 ```sh
-cargo test                                  # 76 unit tests, no network
-cargo build && python tools/e2e_test.py     # 67 checks, ~12s
+cargo test                                  # 80 unit tests, no network
+cargo build && python tools/e2e_test.py     # 78 checks, ~15s
 ```
 
 Unit tests cover the pure logic: path sanitising (the Zip-Slip corpus),

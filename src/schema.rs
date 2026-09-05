@@ -48,6 +48,18 @@ pub const FOILED_ENTRY_NAME: &str = "update.foiled";
 /// than no template at all.
 pub const ORIGIN_TEMPLATE: &str = include_str!("../templates/starfall.origin");
 pub const FOILED_TEMPLATE: &str = include_str!("../templates/update.foiled");
+/// The manifest **body** a studio writes and feeds to `hermes studio sign`.
+/// Not the published document - that is the signed envelope `sign` produces.
+pub const PAYLOAD_TEMPLATE: &str = include_str!("../templates/payload.json");
+/// A complete signed manifest, for reading rather than copying. It is really
+/// signed by the key in [`ORIGIN_TEMPLATE`], and the test below verifies that -
+/// so the pair cannot drift apart, and the example cannot decay into
+/// plausible-looking JSON that would never actually pass.
+///
+/// Test-only: nothing at runtime needs it, and embedding an example in every
+/// shipped binary would be dead weight.
+#[cfg(test)]
+pub const MANIFEST_EXAMPLE: &str = include_str!("../templates/manifest.json");
 
 // ---------------------------------------------------------------------------
 // .origin
@@ -1259,6 +1271,40 @@ mod tests {
         // The [locate] block is commented out: most plans do not need it, and
         // one left on by accident would ask every user an odd question.
         assert!(plan.locate.is_none());
+    }
+
+    /// The payload template is copied and edited, so it has to satisfy the
+    /// same shape checks a real one does - a studio should never find out that
+    /// the starting point was invalid.
+    #[test]
+    fn the_payload_template_is_a_valid_manifest_body() {
+        let manifest: Manifest =
+            serde_json::from_str(PAYLOAD_TEMPLATE).expect("payload template deserialises");
+        manifest.validate_shape().expect("payload template validates");
+        assert_eq!(manifest.origin_id, "moonforge.starfall");
+        // It demonstrates the two things studios most often get wrong.
+        assert!(manifest.platforms.is_some(), "should show a platforms map");
+        assert!(manifest.versions.is_some(), "should show a version catalogue");
+    }
+
+    /// The example manifest is signed by the example `.origin`'s key. Checking
+    /// it here means the pair cannot drift apart: regenerate one without the
+    /// other and this fails.
+    #[test]
+    fn the_example_manifest_verifies_against_the_example_origin() {
+        let origin = OriginFile::parse(ORIGIN_TEMPLATE.as_bytes()).expect("origin template");
+        let verified = crate::security::crypto::verify_manifest(
+            &origin,
+            MANIFEST_EXAMPLE.as_bytes(),
+            1_767_225_600,
+        )
+        .expect("the example manifest must verify against the example origin");
+        assert_eq!(verified.latest_version, "1.4.0");
+        assert_eq!(
+            verified.releases().unwrap().len(),
+            2,
+            "the example should show a catalogue"
+        );
     }
 
     /// The whole point of the .origin format is that it is an address, not a

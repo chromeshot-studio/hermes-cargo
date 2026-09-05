@@ -1,14 +1,27 @@
+# Signing keys never belong in a repository. Anyone holding one can sign an
+# update that every HERMES user installs, without touching any server.
+#
+# `release.py` and `studio.py` keep keys in ~/.hermes-keys, outside any repo.
+# These rules are the second line of defence.
+#
+# Note: git only treats `#` as a comment at the START of a line. A trailing
+# comment makes the pattern above it useless while looking protective, so
+# every comment here stays on its own line.
+*.key
+*.pem
+keys/
+.hermes-keys/
+hermes
+
+# Build output. `cargo build` and `release.py` recreate all of it, and dist/
+# holds an unsigned payload.json that must never be published.
 /target
 /dist
 .staging/
-keys
+
+# Local scratch
 rooter.origin
 ARCHITECTURE.md
 
-# Signing keys never belong in the repository. release.py keeps them in your
-# home directory; this is the second line of defence.
-keys
-*.key
-
-# Cargo.lock is committed: this is a binary, and pinning the exact
-# dependency graph is part of the supply-chain story.
+# Cargo.lock IS committed: this is a binary, and pinning the exact dependency
+# graph is part of the supply-chain story.

@@ -266,10 +266,15 @@ sign an update that every HERMES user installs.
 You host two files on any static host (S3, R2, a VPS, GitHub Releases) and hand
 out one small file. That is the entire integration.
 
+The guided path is [`tools/studio.py`](tools/studio.py) — `init` once, then
+`release` per version, and it maintains the version catalogue for you. See
+[DEVELOPERS.md](DEVELOPERS.md). By hand, it is six commands:
+
 ```sh
-# 0. Start from a commented template of each document rather than a blank file.
-hermes studio template origin --out starfall.origin
-hermes studio template foiled --out update.foiled
+# 0. Start from a template of each document rather than a blank file.
+hermes studio template origin   --out starfall.origin
+hermes studio template foiled   --out update.foiled
+hermes studio template manifest --out payload.json
 
 # 1. One-time: generate your signing key. Keep the .key file OFFLINE.
 hermes studio keygen --id moonforge.starfall --out ./keys
@@ -299,8 +304,12 @@ hermes studio new-origin --key ./keys/moonforge.starfall.key \
 hermes studio verify --origin ./starfall.origin --manifest ./manifest.json
 ```
 
-Both templates also live in [`templates/`](templates/) in this repository, and
-`hermes inspect <file>` reads either one back without acting on it.
+All three live in [`templates/`](templates/) in this repository, alongside
+[`templates/manifest.json`](templates/manifest.json) — a complete *signed*
+manifest to read rather than copy. It is really signed by the key in
+`templates/starfall.origin`, so `hermes studio verify` passes on the pair.
+`hermes inspect <file>` reads a `.origin` or `.foiled` back without acting
+on it.
 
 **[DEVELOPERS.md](DEVELOPERS.md) is the full guide** — keys, both file formats
 field by field, signing, publishing to GitHub Releases, offering several
@@ -507,7 +516,7 @@ approved, so an update cannot escalate into arbitrary code execution.
 | `update [id]` | Download, verify, ask, swap. `--yes`, `--install-dir`, `--force` |
 | `login <id>` / `logout <id>` | Studio session via localhost callback |
 | `install-system` / `uninstall-system` | Desktop icons and file associations |
-| `studio template <origin\|foiled>` | Write a commented starter document |
+| `studio template <origin\|foiled\|manifest>` | Write a starter document |
 | `studio keygen \| sign \| new-origin \| checksum \| verify` | Publisher-side tooling |
 
 Exit codes: `0` success, `1` ordinary failure, `2` **security check failed**.

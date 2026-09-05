@@ -11,21 +11,51 @@ You host everything. There is no HERMES server, no account with anyone, no
 registry to submit to and no review to pass. If you can put two files on a URL,
 you can ship updates.
 
+## The short version
+
+[`tools/studio.py`](tools/studio.py) does all of it. Copy it into your project:
+
+```sh
+python studio.py init                        # asks a few questions, once
+# put the files your update installs into build/, and edit update.foiled
+python studio.py release --version 1.0.0
+```
+
+`init` makes your signing key, your `.origin`, a starter `update.foiled` and a
+`build/` folder, and remembers the answers.
+
+`release` packages, checksums, signs, verifies the result the way a user's CLI
+will, and prints the commands to publish it — and it carries each release
+forward into the version catalogue, so after three releases your users can pick
+any of the three without you maintaining a list.
+
+**Editing the plan is the step people skip.** It ships with the example's
+filenames, so `release` refuses to package a plan naming files your `build/`
+does not have, and tells you which ones. That failure would otherwise land on
+your users, halfway through an update, instead of on you.
+
+It calls `hermes studio ...` for every key, signature and checksum, so it
+cannot disagree with the CLI that verifies its output.
+
+The rest of this guide is what that script is doing, in case you want to do it
+yourself, script it differently, or debug it.
+
 ## Contents
 
-1. [The three files](#the-three-files)
-2. [Step 1 — make a signing key](#step-1--make-a-signing-key)
-3. [Step 2 — write the `.origin`](#step-2--write-the-origin)
-4. [Step 3 — write the `.foiled` plan](#step-3--write-the-foiled-plan)
-5. [Step 4 — package the release](#step-4--package-the-release)
-6. [Step 5 — sign the manifest](#step-5--sign-the-manifest)
-7. [Step 6 — publish](#step-6--publish)
-8. [Offering more than one version](#offering-more-than-one-version)
-9. [Shipping for several platforms](#shipping-for-several-platforms)
-10. [Patching software HERMES did not install](#patching-software-hermes-did-not-install)
-11. [If your software needs an account](#if-your-software-needs-an-account)
-12. [Rotating a key](#rotating-a-key)
-13. [Release checklist](#release-checklist)
+1. [The short version](#the-short-version)
+2. [The three files](#the-three-files)
+3. [Step 1 — make a signing key](#step-1--make-a-signing-key)
+4. [Step 2 — write the `.origin`](#step-2--write-the-origin)
+5. [Step 3 — write the `.foiled` plan](#step-3--write-the-foiled-plan)
+6. [Step 4 — package the release](#step-4--package-the-release)
+7. [Step 5 — sign the manifest](#step-5--sign-the-manifest)
+8. [Step 6 — publish](#step-6--publish)
+9. [Offering more than one version](#offering-more-than-one-version)
+10. [Shipping for several platforms](#shipping-for-several-platforms)
+11. [Patching software HERMES did not install](#patching-software-hermes-did-not-install)
+12. [If your software needs an account](#if-your-software-needs-an-account)
+13. [Rotating a key](#rotating-a-key)
+14. [Release checklist](#release-checklist)
 
 ## The three files
 
@@ -39,12 +69,19 @@ The `.origin` is the only thing a user has to trust, and they get it from you
 once. Everything after that is verified against the key inside it, so your CDN,
 your mirrors and the network in between are all untrusted transport.
 
-Start each of the two you write by hand from a commented template:
+Start from a template rather than a blank file:
 
 ```sh
-hermes studio template origin --out starfall.origin
-hermes studio template foiled --out update.foiled
+hermes studio template origin   --out starfall.origin
+hermes studio template foiled   --out update.foiled
+hermes studio template manifest --out payload.json
 ```
+
+The third is the manifest *body* — the part you write. `hermes studio sign`
+turns it into the `manifest.json` you upload. `templates/manifest.json` in this
+repository is a complete signed example to read: it is really signed by the key
+in `templates/starfall.origin`, so `hermes studio verify --origin
+templates/starfall.origin --manifest templates/manifest.json` passes.
 
 ## Step 1 — make a signing key
 
@@ -226,7 +263,9 @@ ordinary zip of ordinary files is fine.
 
 ## Step 5 — sign the manifest
 
-Write the payload — the inner object, not the whole document:
+Write the payload — the inner object, not the whole document. Start from
+`hermes studio template manifest`, which gives you this with a `platforms` map
+and a version catalogue already filled in as examples:
 
 ```json
 {
@@ -262,8 +301,26 @@ hermes studio sign --key ~/.hermes-keys/moonforge.starfall.key \
 ```
 
 The signature covers the payload's **raw bytes**, embedded verbatim in the
-output. Do not reformat `manifest.json` afterwards — reindenting it breaks the
-signature.
+output, which is why the document looks a little oddly indented:
+
+```json
+{
+  "payload": {
+  "schema": "hermes.manifest/v1",
+  ...
+},
+  "signature": {
+    "algorithm": "ed25519",
+    "value": "5CNeaXKd2d7Ijaee...",
+    "key_id": "moonforge.starfall"
+  }
+}
+```
+
+Your payload went in exactly as you wrote it. **Do not reformat
+`manifest.json` afterwards** — reindenting it, or piping it through a JSON
+prettifier, changes those bytes and breaks the signature. If you need to change
+something, edit the payload and sign again.
 
 Before publishing, check it the way a user's CLI will:
 
@@ -346,9 +403,12 @@ platforms but not the user's is an error rather than a silent fallback —
 quietly installing another platform's binary is worse than saying there is no
 build. Catalogue entries under `versions` take their own `platforms` map too.
 
-`tools/release.py` in this repository builds, packages, checksums and signs in
-one command, accumulating the `platforms` map as you build on each machine.
-It is worth reading even if you write your own.
+`tools/studio.py release --per-platform` builds this map for you: run it on
+each machine with the same `--version`, and each run adds its own entry to the
+same release rather than replacing it.
+
+(`tools/release.py` does the same job specifically for HERMES's own releases,
+and is worth reading if you want a shorter example to adapt.)
 
 ## Patching software HERMES did not install
 
@@ -423,6 +483,9 @@ There is no revocation, because there is nobody to revoke through. The pin is
 the authority, which is the point of the design and also its sharpest edge.
 
 ## Release checklist
+
+`tools/studio.py release` does 1 to 6 of this for you. It is written out
+because knowing what a release *is* makes the failures legible.
 
 1. Bump `version` in your `.foiled`; it must match `latest_version`.
 2. `hermes inspect update.foiled` — read the scope as a user would.

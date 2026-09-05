@@ -6,3 +6,11 @@
 *.ico binary
 *.icns binary
 *.zip binary
+
+# A signed manifest's signature covers the raw bytes of its payload, so any
+# end-of-line conversion invalidates it - and it fails at verification time,
+# in a user's terminal, looking exactly like a tampered document. Treat these
+# as untouchable. The same applies to any manifest.json a studio commits.
+templates/manifest.json -text
+templates/payload.json  -text
+manifest.json           -text

@@ -246,7 +246,7 @@ def main():
     (WORK / "keys").mkdir()
     serve_dir = WORK / "serve"
 
-    print("\n== studio side ==")
+    print("\n== templates ==")
 
     # The templates a studio actually starts from. A template that does not
     # survive `inspect` is worse than no template at all.
@@ -284,6 +284,127 @@ def main():
           split.stdout + split.stderr)
     hermes("remove", "moonforge.starfall", expect=None)
 
+    # tools/studio.py is the guided path a studio actually uses. Drive it the
+    # way one would: set a project up, then ship twice.
+    print("\n== tools/studio.py ==")
+    project = WORK / "guided"
+    project.mkdir(parents=True)
+    guided_keys = WORK / "guided-keys"
+    studio_py = ROOT / "tools" / "studio.py"
+
+    def studio(*args, expect=0):
+        proc = subprocess.run(
+            [sys.executable, str(studio_py), "--project", str(project), *map(str, args)],
+            capture_output=True, text=True, cwd=project, env=cli_env())
+        if expect is not None and proc.returncode != expect:
+            print(proc.stdout)
+            print(proc.stderr, file=sys.stderr)
+            raise SystemExit(f"studio.py {args[0]} exited {proc.returncode}")
+        return proc
+
+    studio("init", "--id", "guided.app", "--name", "Guided",
+           "--publisher", "Guided Studio",
+           "--manifest-url", f"http://127.0.0.1:{PORT}/guided/manifest.json",
+           "--key", guided_keys / "guided.app.key")
+    check("studio.py init generated a key outside the project",
+          (guided_keys / "guided.app.key").exists() and not any(project.rglob("*.key")))
+    check("studio.py init wrote a usable .origin",
+          "Guided" in hermes("inspect", project / "guided.app.origin").stdout)
+    check("studio.py init wrote a plan for this project",
+          'origin_id = "guided.app"' in
+          (project / "update.foiled").read_text(encoding="utf-8"))
+
+    check("studio.py init created the folder that gets packaged",
+          (project / "build").is_dir())
+
+    # A generated project must refuse to commit a signing key. Asked of git
+    # itself, not of the file's text: a .gitignore can contain `*.key` and
+    # still ignore nothing (git only honours `#` comments at the start of a
+    # line, so a trailing one silently makes the pattern useless).
+    gitignore = project / ".gitignore"
+    check("studio.py init wrote a .gitignore", gitignore.exists())
+    if shutil.which("git"):
+        subprocess.run(["git", "init", "-q"], cwd=project, capture_output=True)
+        (project / "planted.key").write_text("not a real key", encoding="utf-8")
+        (project / "dist").mkdir(exist_ok=True)
+        (project / "dist" / "planted.json").write_text("{}", encoding="utf-8")
+        status = subprocess.run(["git", "status", "--short"], cwd=project,
+                                capture_output=True, text=True).stdout
+        check("git really ignores a signing key in a generated project",
+              "planted.key" not in status, status)
+        check("git really ignores the dist/ output too",
+              "dist/" not in status and "planted.json" not in status, status)
+        (project / "planted.key").unlink()
+        shutil.rmtree(project / ".git", ignore_errors=True)
+
+    # An existing .gitignore must be added to, never replaced.
+    other = WORK / "guided-existing"
+    other.mkdir()
+    (other / ".gitignore").write_text("/node_modules\n", encoding="utf-8")
+    subprocess.run([sys.executable, str(studio_py), "--project", str(other), "init",
+                    "--id", "kept.rules", "--name", "Kept", "--repo", "me/kept",
+                    "--key", str(guided_keys / "kept.rules.key")],
+                   capture_output=True, text=True, cwd=other, env=cli_env())
+    kept = (other / ".gitignore").read_text(encoding="utf-8")
+    check("an existing .gitignore keeps its own rules",
+          "/node_modules" in kept and "*.key" in kept, kept)
+
+    # The starter plan still names the example's files. Releasing it would
+    # produce an update that fails partway through on every user's machine, so
+    # it has to fail here instead - naming exactly what is missing.
+    premature = studio("release", "--version", "0.0.1", expect=None)
+    combined = premature.stdout + premature.stderr
+    check("studio.py refuses to ship a plan whose files are missing",
+          premature.returncode != 0 and "does not contain" in combined, combined)
+    check("...and says which files they are",
+          "bin/starfall.exe" in combined and "content.zip" in combined, combined)
+    check("nothing was written for the refused release",
+          not (project / "dist" / "manifest.json").exists())
+
+    build = project / "build" / "bin"
+    build.mkdir(parents=True, exist_ok=True)
+    (project / "build" / "README.txt").unlink(missing_ok=True)
+    (build / "app.txt").write_text("v1", encoding="utf-8")
+    (project / "update.foiled").write_text('''schema    = "hermes.foiled/v1"
+origin_id = "guided.app"
+version   = "1.0.0"
+base      = "clone"
+
+[[scope]]
+path      = "bin"
+recursive = true
+access    = "write"
+reason    = "install the app"
+
+[[steps]]
+action = "copy"
+from   = "bin/app.txt"
+to     = "bin/app.txt"
+''', encoding="utf-8")
+    (project / "NOTES.md").write_text("- the first one", encoding="utf-8")
+
+    first = studio("release", "--version", "1.0.0",
+                   "--base-url", f"http://127.0.0.1:{PORT}/guided",
+                   "--notes", project / "NOTES.md")
+    check("studio.py release signs and verifies against its own .origin",
+          "signature verified" in first.stdout, first.stdout)
+
+    (build / "app.txt").write_text("v2", encoding="utf-8")
+    second = studio("release", "--version", "1.1.0",
+                    "--base-url", f"http://127.0.0.1:{PORT}/guided")
+    check("studio.py bumps the plan version to match the release",
+          "version 1.0.0 -> 1.1.0" in second.stdout, second.stdout)
+    # The catalogue is the part nobody maintains by hand, so it has to be right.
+    check("studio.py carries the previous release into the catalogue",
+          "manifest offers: 1.1.0, 1.0.0" in second.stdout, second.stdout)
+    guided_payload = json.loads(
+        (project / "dist" / "payload.json").read_text(encoding="utf-8"))
+    check("the carried entry keeps its own archive and notes",
+          guided_payload["versions"][0]["download_url"].endswith("guided.app-1.0.0.zip")
+          and guided_payload["versions"][0]["release_notes"] == "- the first one",
+          guided_payload["versions"][0])
+
+    print("\n== studio side ==")
     hermes("studio", "keygen", "--id", "demo.game", "--out", WORK / "keys")
     key = WORK / "keys" / "demo.game.key"
     check("keygen wrote a key file", key.exists())
