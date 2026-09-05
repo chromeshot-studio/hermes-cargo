@@ -1,0 +1,64 @@
+# Licensing
+
+HERMES is split into three things that are licensed differently, because they
+protect different things.
+
+## 1. The code — MIT OR Apache-2.0
+
+Everything in `src/`, `tools/`, and the build configuration is dual-licensed
+under either of:
+
+* Apache License, Version 2.0 — see [LICENSE-APACHE](LICENSE-APACHE)
+* MIT License — see [LICENSE-MIT](LICENSE-MIT)
+
+at your option. This is the standard Rust ecosystem arrangement: Apache-2.0
+carries an explicit patent grant, MIT is maximally permissive and simple, and
+you pick whichever fits your project.
+
+Unless you state otherwise, any contribution you intentionally submit for
+inclusion in this work shall be dual-licensed as above, with no additional
+terms or conditions.
+
+## 2. The icons — CC BY 4.0
+
+Everything in `assets/` is licensed under the Creative Commons
+Attribution 4.0 International License (<https://creativecommons.org/licenses/by/4.0/>).
+
+The icons are generated from geometric primitives by `tools/gen_icons.py` — no
+traced artwork, no fonts, no third-party assets — so they are free of any
+upstream encumbrance. See [assets/LICENSE](assets/LICENSE).
+
+## 3. The name and the mark — reserved
+
+**"HERMES", the HERMES word mark, and the HERMES icons as identifiers of this
+project are NOT covered by the licenses above.**
+
+This is not a formality, and it is not about branding. HERMES's entire security
+model rests on a user trusting that the CLI on their machine is an honest,
+empty shell — one that will refuse an unsigned update, refuse a path that
+escapes its sandbox, and refuse folder access a plan did not declare. The name
+and the icon are the only signals a user has that they are looking at a genuine
+HERMES binary and a genuine `.origin` file.
+
+So: fork the code freely, modify it freely, ship it freely. But if you
+distribute a modified build, **give it your own name and your own icon.** A
+patched binary that still calls itself HERMES and still shows the HERMES icon
+is a phishing vector, not a fork.
+
+You may of course use the name to refer to this project — "compatible with
+HERMES", "built on HERMES", writing about it, packaging an unmodified build.
+That is nominative use and it is fine.
+
+## Summary
+
+| What | License | You may |
+| --- | --- | --- |
+| `src/`, `tools/` | MIT OR Apache-2.0 | do essentially anything |
+| `assets/` | CC BY 4.0 | reuse with attribution |
+| The name "HERMES" and its marks | reserved | refer to the project, not rebadge a fork |
+
+## A note on the copyright line
+
+The license files say `The HERMES Authors`. If you are the sole copyright
+holder, replace that with your legal name or entity in `LICENSE-MIT` and in the
+`Copyright` line before publishing.

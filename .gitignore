@@ -1,0 +1,5 @@
+/target
+.staging/
+
+# Cargo.lock is committed: this is a binary, and pinning the exact
+# dependency graph is part of the supply-chain story.

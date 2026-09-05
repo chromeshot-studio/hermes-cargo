@@ -1,0 +1,8 @@
+# Normalise to LF in the repository; check out native on Windows.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.ico binary
+*.icns binary
+*.zip binary

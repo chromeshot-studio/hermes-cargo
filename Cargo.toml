@@ -1,0 +1,43 @@
+[package]
+name = "hermes"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "HERMES - a zero-infrastructure, decentralized CLI updater"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+ed25519-dalek = "2"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+semver = "1"
+url = "2"
+walkdir = "2"
+rand = "0.8"
+dirs = "5"
+zip = { version = "2.2", default-features = false, features = ["deflate", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip"] }
+tiny_http = "0.12"
+webbrowser = "1"
+toml = "0.9.6"
+crossterm = "0.29.0"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
