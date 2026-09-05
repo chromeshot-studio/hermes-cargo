@@ -79,12 +79,6 @@ mod embedded {
     #[cfg(target_os = "linux")]
     pub const HERMES_PNGS: &[(u32, &[u8])] = png_set!("hermes");
 
-    #[cfg(target_os = "linux")]
-    pub const ORIGIN_SVG: &[u8] = include_bytes!("../assets/icons/origin.svg");
-    #[cfg(target_os = "linux")]
-    pub const FOILED_SVG: &[u8] = include_bytes!("../assets/icons/foiled.svg");
-    #[cfg(target_os = "linux")]
-    pub const HERMES_SVG: &[u8] = include_bytes!("../assets/icons/hermes.svg");
 }
 
 #[derive(Debug, Default)]
@@ -170,9 +164,8 @@ fn extract_icons() -> Result<PathBuf> {
     }
     #[cfg(target_os = "linux")]
     {
-        write_icon(&dir, "origin.svg", embedded::ORIGIN_SVG)?;
-        write_icon(&dir, "foiled.svg", embedded::FOILED_SVG)?;
-        write_icon(&dir, "hermes.svg", embedded::HERMES_SVG)?;
+        // Linux reads its icons straight out of the hicolor theme, which
+        // `platform::install` populates; nothing extra is needed here.
     }
     Ok(dir)
 }
@@ -505,13 +498,15 @@ mod platform {
         )
     }
 
-    /// Install one icon into every hicolor size, plus the scalable SVG.
+    /// Install one icon into every hicolor size the theme spec expects.
+    ///
+    /// The artwork is raster, so there is no `scalable/` SVG to install; a
+    /// 256px PNG is what every current desktop actually picks up.
     fn install_icon_set(
         data: &Path,
         theme_name: &str,
         context: &str,
         pngs: &[(u32, &[u8])],
-        svg: &[u8],
         report: &mut Report,
     ) -> Result<()> {
         for (size, bytes) in pngs {
@@ -522,9 +517,6 @@ mod platform {
             fs::create_dir_all(&dir)?;
             fs::write(dir.join(format!("{theme_name}.png")), bytes)?;
         }
-        let scalable = data.join("icons/hicolor/scalable").join(context);
-        fs::create_dir_all(&scalable)?;
-        fs::write(scalable.join(format!("{theme_name}.svg")), svg)?;
         report.did(format!("installed icon '{theme_name}' ({context})"));
         Ok(())
     }
@@ -554,7 +546,6 @@ mod platform {
             "application-x-hermes-origin",
             "mimetypes",
             embedded::ORIGIN_PNGS,
-            embedded::ORIGIN_SVG,
             report,
         )?;
         install_icon_set(
@@ -562,7 +553,6 @@ mod platform {
             "application-x-hermes-foiled",
             "mimetypes",
             embedded::FOILED_PNGS,
-            embedded::FOILED_SVG,
             report,
         )?;
         install_icon_set(
@@ -570,7 +560,6 @@ mod platform {
             "hermes",
             "apps",
             embedded::HERMES_PNGS,
-            embedded::HERMES_SVG,
             report,
         )?;
 
@@ -630,13 +619,6 @@ mod platform {
                         .join(format!("{name}.png"));
                     let _ = fs::remove_file(p);
                 }
-            }
-            for context in ["mimetypes", "apps"] {
-                let p = data
-                    .join("icons/hicolor/scalable")
-                    .join(context)
-                    .join(format!("{name}.svg"));
-                let _ = fs::remove_file(p);
             }
         }
 
